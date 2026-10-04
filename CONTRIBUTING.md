@@ -16,15 +16,17 @@ IndustriConnect:
   [IndustriAgents/EtherNetIP-MCP](https://github.com/IndustriAgents/EtherNetIP-MCP).
 - IndustriConnect cannot take edits to files under `EtherNetIP-Project/`; it
   only records which commit of this repository it uses.
-- When `main` moves, the `notify-industriconnect` workflow asks IndustriConnect
-  to bump that pointer. IndustriConnect also checks for a new `main` on a
-  nightly schedule.
+- When `main` moves, the `notify-industriconnect` workflow sends a
+  `protocol-mcp-updated` dispatch to IndustriConnect (only once the
+  `INDUSTRICONNECT_DISPATCH_TOKEN` secret is set; until then it logs a warning
+  and skips). Whether and when the pointer is bumped is decided by
+  IndustriConnect's own workflows, not by this repository.
 
 ## Repository layout
 
 ```text
 EtherNetIP-MCP/
-├── ethernetip-python/        # the MCP server: pyproject.toml + src/ethernetip_mcp/
+├── ethernetip-python/        # the MCP server: pyproject.toml + src/ethernetip_mcp/ + tests/
 ├── ethernetip-mock-server/   # a simulated PLC, so nothing is rehearsed on live plant
 └── README.md                 # quickstart, configuration and tool list
 ```
@@ -40,10 +42,11 @@ change that breaks one of these needs a reason in the pull request:
 1. **One response envelope.** Every tool returns `{ success, data, error, meta }`.
    A client that can read one IndustriConnect server's output can read all of
    them.
-2. **Writes are gated.** Tools that write a tag change a running controller.
-   They are refused when `ENIP_WRITES_ENABLED=false`, and system commands such
-   as `set_plc_time` are refused unless `ENIP_SYSTEM_CMDS_ENABLED=true`. A new
-   tool that writes must go through the same guard.
+2. **Read-only by default.** Tools that write a tag change a running
+   controller. They are refused unless `ENIP_WRITES_ENABLED=true`, and system
+   commands such as `set_plc_time` are refused unless
+   `ENIP_SYSTEM_CMDS_ENABLED=true`. A new tool that writes must go through the
+   same guard, and the defaults stay off.
 3. **The mock can answer it.** If you add a tool, the mock has to be able to
    answer it, or nobody can test it without a plant.
 4. **Tool names line up with the rest of the suite.** Keep tool and argument
@@ -67,8 +70,10 @@ mock through its JSON bridge:
 ```bash
 cd ethernetip-python
 uv sync --extra dev
-ENIP_HOST=127.0.0.1 ENIP_PORT=5025 ENIP_JSON_BRIDGE=true uv run ethernetip-mcp
+ENIP_HOST=127.0.0.1 ENIP_PORT=5025 ENIP_JSON_BRIDGE=true ENIP_WRITES_ENABLED=true uv run ethernetip-mcp
 ```
+
+Leave out `ENIP_WRITES_ENABLED=true` to see the read-only default.
 
 The server speaks MCP over stdio, so started like this it waits for a client on
 stdin. To drive it by hand, use the
@@ -83,33 +88,51 @@ npx @modelcontextprotocol/inspector \
 
 ## Testing a change
 
-There is no automated test suite yet. CI (`.github/workflows/ci.yml`) runs
-cheap checks that need no device. Run them before you push, from the
-repository root:
+CI (`.github/workflows/ci.yml`) needs no device. Run the same steps before you
+push, from the repository root:
 
 ```bash
 cd ethernetip-python
 uv sync --locked --extra dev
+(cd ../ethernetip-mock-server && uv sync --locked)   # the integration tests start the mock
+uv run --locked ruff check src tests
+uv run --locked ruff format --check src tests
 uv run --locked python -m compileall -q src
 uv run --locked python -c "import ethernetip_mcp; from ethernetip_mcp.cli import main"
+ENIP_REQUIRE_INTEGRATION=1 uv run --locked pytest -v
 
 cd ../ethernetip-mock-server
-uv sync --locked
+uv sync --locked --extra dev
+uv run --locked ruff check .
+uv run --locked ruff format --check .
 uv run --locked python -m compileall -q eip_mock_server.py
 uv run --locked python -c "import eip_mock_server"
 uv run --locked ethernetip-mock-server --help
 ```
 
-CI also builds the server in-process and checks that its tools register; the
-exact snippet is in the workflow.
+CI also builds the server in-process and checks that every tool registers with
+a description; the exact snippet is in the workflow.
 
-Then drive the server the way a user would, through the Inspector or a real MCP
-client, against the mock. Call the tool you changed, and check the envelope,
-not just the value.
+The test suite in `ethernetip-python/tests` has three layers:
+
+- **Unit tests** for configuration, the tools (over an in-memory MCP session)
+  and the `pycomm3` path. There is no controller in CI, so
+  `tests/fake_pycomm3.py` provides a `LogixDriver` subclass that binds every
+  call against the installed `pycomm3` method signatures and rejects anything
+  `pycomm3` would reject. Use it for any change to how the client calls
+  `pycomm3`.
+- **JSON-bridge tests** that start the mock PLC on a free port and talk to it.
+- **Integration tests** that start the mock and drive the real
+  `ethernetip-mcp` process over stdio with the MCP client SDK, including a
+  check that nothing but JSON-RPC reaches stdout.
+
+Add a test with every fix or tool change. Then, if you like, drive the server
+the way a user would, through the Inspector or a real MCP client, against the
+mock. Check the envelope, not just the value.
 
 The JSON bridge (`ENIP_JSON_BRIDGE=true`) exercises the server's tools and the
-client's bridge code, but not the `pycomm3` code path that talks CIP to a real
-controller. If your change touches that path, say so in the pull request and
+client's bridge code, but not CIP traffic to a real controller. If your change
+touches the `pycomm3` path, say so in the pull request and, if you have one,
 describe the bench you verified it on: controller family, firmware, and slot or
 route.
 
@@ -128,9 +151,11 @@ If you add dependencies, update the lockfile in the same pull request
 - Fail at startup, not at the first tool call, when configuration is unusable.
 - Keep tool names and argument names aligned with the other IndustriConnect
   servers.
-- `ruff` is available through the `dev` extra (`uv run ruff check src`). The
-  existing code is not yet clean under it, so CI does not enforce it, but new
-  code should not add findings.
+- `ruff check` and `ruff format --check` must pass; both come with the `dev`
+  extra (`uv run --extra dev ruff check src tests`), and CI enforces them in
+  both projects.
+- Read configuration when the server is built (after `load_dotenv()`), never
+  at import time, and reject invalid values with a `ConfigError`.
 
 ## Pull requests
 
