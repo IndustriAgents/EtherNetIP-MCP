@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 from conftest import server_command, server_env
@@ -130,27 +131,15 @@ def test_importing_reads_no_configuration(monkeypatch: pytest.MonkeyPatch) -> No
     assert server.client.config.port == 5025
 
 
-def test_cli_reads_configuration_after_load_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cli_reads_configuration_after_loading_the_env_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in ("ENIP_WRITES_ENABLED", "ENIP_PORT", "ENIP_JSON_BRIDGE", "ENIP_TIMEOUT"):
         monkeypatch.delenv(name, raising=False)
-
-    def fake_load_dotenv(*args: object, **kwargs: object) -> bool:
-        # What a .env file would contribute.
-        os.environ["ENIP_WRITES_ENABLED"] = "true"
-        os.environ["ENIP_PORT"] = "5025"
-        os.environ["ENIP_JSON_BRIDGE"] = "true"
-        os.environ["ENIP_TIMEOUT"] = "2.5"
-        return True
-
+    env_file = tmp_path / "explicit.env"
+    env_file.write_text("ENIP_WRITES_ENABLED=true\nENIP_PORT=5025\nENIP_JSON_BRIDGE=true\nENIP_TIMEOUT=2.5\n")
     built = {}
-
-    def fake_run(self: object) -> None:
-        built["server"] = self
-
-    monkeypatch.setattr(cli, "load_dotenv", fake_load_dotenv)
-    monkeypatch.setattr(cli.EtherNetIPMCPServer, "run", fake_run)
+    monkeypatch.setattr(cli.EtherNetIPMCPServer, "run", lambda self: built.setdefault("server", self))
     try:
-        cli.main()
+        cli.main(["--env-file", str(env_file)])
     finally:
         for name in ("ENIP_WRITES_ENABLED", "ENIP_PORT", "ENIP_JSON_BRIDGE", "ENIP_TIMEOUT"):
             os.environ.pop(name, None)
