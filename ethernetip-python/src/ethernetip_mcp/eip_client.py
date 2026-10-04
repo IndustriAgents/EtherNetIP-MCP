@@ -72,33 +72,48 @@ class _NotSentError(EIPClientError):
     """A write refused locally, before anything was sent to the device."""
 
 
-class _DeadlineExpired(Exception):
-    """Raised in an abandoned worker thread so it stops instead of retrying."""
+class _CallStopped(Exception):
+    """Raised in a worker thread so it stops before sending anything.
+
+    Either its call is over (the deadline expired, or the MCP client cancelled
+    the call or disconnected), or the client as a whole is shutting down.
+    """
 
 
 class _CallState:
-    """Shared by a tool call and its worker thread, to agree on what happened."""
+    """Shared by a tool call and its worker thread, to agree on what happened.
 
-    def __init__(self) -> None:
+    ``cancel()`` and ``enter_operation()`` take the same guard, so a worker
+    either enters the operation before the call is cancelled (and the call
+    knows the request may have been sent) or never sends it at all.
+    """
+
+    def __init__(self, closing: Callable[[], bool] = lambda: False) -> None:
         self._guard = threading.Lock()
+        self._closing = closing
         self.phase = "open"
         self.cancelled = False
+        self.holding_session = False
 
     def check(self) -> None:
-        if self.cancelled:
-            raise _DeadlineExpired
+        if self.cancelled or self._closing():
+            raise _CallStopped
 
     def enter_operation(self) -> None:
         with self._guard:
-            if self.cancelled:
-                raise _DeadlineExpired
+            if self.cancelled or self._closing():
+                raise _CallStopped
             self.phase = "operation"
 
-    def cancel(self) -> str:
-        """Stop the worker; returns the phase it had reached."""
+    def set_holding(self, holding: bool) -> None:
+        with self._guard:
+            self.holding_session = holding
+
+    def cancel(self) -> tuple[str, bool]:
+        """Stop the worker; returns the phase it reached and whether it holds the session."""
         with self._guard:
             self.cancelled = True
-            return self.phase
+            return self.phase, self.holding_session
 
 
 def with_outcome(meta: OperationMeta, outcome: str) -> OperationMeta:
@@ -680,12 +695,26 @@ class EIPClient:
         self._last_contact: float | None = None
         self._last_io = 0.0  # time.monotonic() of the last successful exchange on the CIP session
         self._active_driver: Any = None  # the driver a worker thread may be blocked in
+        self._closing = False  # set by shutdown(): the MCP client is gone
 
     @property
     def backend(self) -> str:
         return "json_bridge" if self.config.json_bridge else "cip"
 
     # -- lifecycle ----------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """The MCP client is gone: nothing more may be sent to the device.
+
+        Calls already past the point of sending are unaffected; every other
+        pending or later call stops before connecting or sending (not_sent).
+        The server also cancels the in-flight tool calls.
+        """
+        self._closing = True
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
 
     async def ensure_connection(self) -> None:
         """Try once to open the CIP session at startup.
@@ -694,16 +723,24 @@ class EIPClient:
         from answering ``initialize``. Each tool call reconnects as needed and
         reports its own errors. The JSON bridge has no session to open.
         """
-        if self.config.json_bridge:
+        if self.config.json_bridge or self._closing:
             return
         deadline = self.config.deadline_s()
+        state = _CallState(lambda: self._closing)
         try:
             try:
                 with anyio.fail_after(deadline):
-                    await anyio.to_thread.run_sync(self._connect_once, abandon_on_cancel=True)
+                    await anyio.to_thread.run_sync(self._connect_once, state, abandon_on_cancel=True)
             except TimeoutError:
-                self._abort_active_socket()
+                _, holding = state.cancel()
+                if holding:
+                    self._abort_active_socket()
                 raise EIPClientError(f"no complete answer within the {deadline:g} s deadline (ENIP_DEADLINE)") from None
+            except BaseException:
+                _, holding = state.cancel()
+                if holding:
+                    self._abort_active_socket()
+                raise
         except Exception as exc:  # noqa: BLE001 - logged, reported by the tools
             message = _describe(exc)
             self._last_error = f"connect: {message}"
@@ -1127,13 +1164,22 @@ class EIPClient:
         self._connected = False
 
     @contextlib.contextmanager
-    def _session(self) -> Any:
-        """Hold the CIP session lock, waiting at most one deadline for it."""
-        if not self._lock.acquire(timeout=self.config.deadline_s()):
+    def _session(self, state: _CallState | None = None, timeout: float | None = None) -> Any:
+        """Hold the CIP session lock, waiting at most one deadline for it.
+
+        With ``state``, record that this call's worker holds the session, so a
+        deadline or cancellation closes the socket only when it is this
+        call's own connection, never a session a queued call is waiting for.
+        """
+        if not self._lock.acquire(timeout=self.config.deadline_s() if timeout is None else timeout):
             raise EIPClientError("the CIP session is still busy with an earlier request")
         try:
+            if state is not None:
+                state.set_holding(True)
             yield
         finally:
+            if state is not None:
+                state.set_holding(False)
             self._lock.release()
 
     def _abort_active_socket(self) -> None:
@@ -1151,14 +1197,16 @@ class EIPClient:
         with contextlib.suppress(OSError):
             sock.close()
 
-    def _connect_once(self) -> None:
-        with self._session():
+    def _connect_once(self, state: _CallState | None = None) -> None:
+        state = state or _CallState()
+        with self._session(state):
+            state.check()
             self._open_locked()
             self._last_contact = time.time()
             self._last_error = None
 
     def _disconnect_sync(self) -> None:
-        with contextlib.suppress(EIPClientError), self._session():
+        with contextlib.suppress(EIPClientError), self._session(timeout=min(self.config.deadline_s(), 5.0)):
             self._drop_driver_locked()
 
     def _execute_sync(
@@ -1177,14 +1225,15 @@ class EIPClient:
         non-repeatable operation, meta always says whether the request was
         sent (``outcome``/``request_sent``) when it fails.
         """
-        state = state or _CallState()
+        state = state or _CallState(lambda: self._closing)
         start = time.perf_counter()
         attempts = 0
         while True:
             attempts += 1
             phase = "open"
             try:
-                with self._session():
+                state.check()
+                with self._session(state):
                     state.check()
                     driver = self._open_locked()
                     if not repeatable:
@@ -1195,7 +1244,7 @@ class EIPClient:
                     self._last_contact = time.time()
                     self._last_io = time.monotonic()
                     self._last_error = None
-            except _DeadlineExpired:
+            except _CallStopped:
                 raise
             except _NotSentError as exc:
                 meta = {
@@ -1257,7 +1306,7 @@ class EIPClient:
         and a write is reported unknown if it may have been sent, not_sent if
         it was still connecting. The socket is closed to stop the worker.
         """
-        state = _CallState()
+        state = _CallState(lambda: self._closing)
         deadline = self.config.deadline_s()
         start = time.perf_counter()
         try:
@@ -1265,12 +1314,20 @@ class EIPClient:
                 return await anyio.to_thread.run_sync(
                     self._execute_sync, label, operation, repeatable, state, abandon_on_cancel=True
                 )
+        except _CallStopped as exc:
+            # The worker refused to start or to send: the MCP client is gone.
+            meta: OperationMeta = {"backend": "cip", "duration_ms": round((time.perf_counter() - start) * 1000.0, 3)}
+            detail = "the MCP client disconnected before the request was sent"
+            raise EIPClientError(
+                f"{label} stopped: {detail}", meta if repeatable else with_outcome(meta, "not_sent")
+            ) from exc
         except TimeoutError as exc:
-            phase = state.cancel()
-            self._abort_active_socket()
+            phase, holding = state.cancel()
+            if holding:
+                self._abort_active_socket()
             detail = f"no complete answer within the {deadline:g} s deadline (ENIP_DEADLINE)"
             self._last_error = f"{label}: {detail}"
-            meta: OperationMeta = {
+            meta = {
                 "backend": "cip",
                 "duration_ms": round((time.perf_counter() - start) * 1000.0, 3),
                 "deadline_s": deadline,
@@ -1280,6 +1337,16 @@ class EIPClient:
             if phase == "operation":
                 raise OutcomeUnknownError(_maybe_applied(label, detail), with_outcome(meta, "unknown")) from exc
             raise EIPClientError(f"{label} failed: {detail}; nothing was sent", with_outcome(meta, "not_sent")) from exc
+        except BaseException:
+            # Cancelled by the MCP client (notifications/cancelled, or it
+            # disconnected): the abandoned worker must never send afterwards.
+            # It stops at its next check or at enter_operation. Only this
+            # call's own connection attempt is closed; an operation already in
+            # flight is left to finish.
+            phase, holding = state.cancel()
+            if holding and phase == "open":
+                self._abort_active_socket()
+            raise
 
     # -- JSON bridge internals -----------------------------------------------
 
@@ -1292,6 +1359,8 @@ class EIPClient:
             raise _TransientError(f"cannot reach the JSON bridge at {address}: {_describe(exc)}") from exc
         raw = b""
         async with stream:
+            if self._closing:  # checked with no await before the send starts
+                raise _CallStopped
             try:
                 progress["sent"] = True
                 await stream.send(json.dumps(payload).encode("utf-8") + b"\n")
@@ -1337,8 +1406,16 @@ class EIPClient:
             progress = {"sent": False}
             limit = min(self.config.timeout, max(deadline - (time.perf_counter() - start), 0.0))
             try:
+                if self._closing:
+                    raise _CallStopped
                 with anyio.fail_after(limit):
                     response = await self._json_request(payload, progress)
+            except _CallStopped:
+                meta = {"backend": "json_bridge", "attempts": attempts}
+                detail = "the MCP client disconnected before the request was sent"
+                raise EIPClientError(
+                    f"{label} stopped: {detail}", meta if repeatable else with_outcome(meta, "not_sent")
+                ) from None
             except TimeoutError as exc:
                 failure: EIPClientError = _TransientError(f"no complete reply within {limit:g} s")
                 failure.__cause__ = exc

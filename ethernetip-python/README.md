@@ -47,6 +47,8 @@ ethernetip-python/
 │   └── eip_client.py   # configuration, pycomm3 (CIP) and JSON-bridge backends
 └── tests
     ├── fake_pycomm3.py         # LogixDriver stand-in that enforces pycomm3's real signatures
+    ├── blackhole_server.py     # the CLI against a fake controller the tests can black-hole
+    ├── test_cancellation.py    # cancelled or abandoned writes are never sent later
     ├── test_config.py
     ├── test_docs.py            # README covers every setting, breaking change and response shape
     ├── test_env.py             # an automatic .env cannot enable writes; --env-file can

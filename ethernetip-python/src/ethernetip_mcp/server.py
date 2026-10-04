@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.stdio import stdio_server
 from pydantic import ValidationError
 
 from .eip_client import EIPClient
@@ -121,7 +123,35 @@ class EtherNetIPMCPServer:
         return self._server
 
     def run(self) -> None:
-        self._server.run()
+        anyio.run(self.run_stdio)
+
+    async def run_stdio(self) -> None:
+        """Serve MCP over stdio, and stop pending device requests when the client leaves.
+
+        On end of input the SDK would let in-flight tool calls run to the end,
+        so a write still queued, connecting or waiting to retry would reach
+        the device after the client is gone. Messages are relayed through a
+        stream; at end of input the client is shut down (nothing more may be
+        sent) and every in-flight call is cancelled.
+        """
+        lowlevel = self._server._mcp_server
+        async with stdio_server() as (read_stream, write_stream):
+            relay_send, relay_receive = anyio.create_memory_object_stream[Any](0)
+            async with anyio.create_task_group() as tg:
+
+                async def relay() -> None:
+                    try:
+                        async for message in read_stream:
+                            await relay_send.send(message)
+                    finally:
+                        logger.info("MCP client disconnected; stopping pending device requests")
+                        self.client.shutdown()
+                        tg.cancel_scope.cancel()
+                        relay_send.close()
+
+                tg.start_soon(relay)
+                await lowlevel.run(relay_receive, write_stream, lowlevel.create_initialization_options())
+                tg.cancel_scope.cancel()
 
     @asynccontextmanager
     async def _lifespan(self, server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: ARG002 - signature contract
@@ -129,4 +159,5 @@ class EtherNetIPMCPServer:
         try:
             yield AppContext(client=self.client)
         finally:
-            await self.client.close()
+            with anyio.CancelScope(shield=True):  # also when the server is being cancelled
+                await self.client.close()

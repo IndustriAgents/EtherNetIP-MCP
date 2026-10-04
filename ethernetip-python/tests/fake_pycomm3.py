@@ -20,6 +20,7 @@ import datetime as dt
 import inspect
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,6 +74,9 @@ class FakeController:
     hang_writes: bool = False
     # Tag.error the liveness probe gets back (a CIP error reply).
     probe_reply_error: str | None = None
+    # If set, open()/read() wait for the event first (a slow controller).
+    open_gate: threading.Event | None = None
+    read_gate: threading.Event | None = None
     drivers: list[FakeLogixDriver] = field(default_factory=list)
     set_time_calls: list[int | None] = field(default_factory=list)
 
@@ -122,6 +126,17 @@ class FakeLogixDriver(LogixDriver):
 
     # -- helpers --------------------------------------------------------------
 
+    def _wait_for(self, gate: threading.Event) -> None:
+        """Wait for a slow controller; fail like a socket if ours is closed meanwhile."""
+        end = time.monotonic() + 30
+        while not gate.wait(0.02):
+            if self._sock is not None and self._sock.sock.closed.is_set():
+                raise CommError("failed to receive reply: socket closed")
+            if time.monotonic() > end:
+                raise AssertionError("gate never opened")
+        if self._sock is not None and self._sock.sock.closed.is_set():
+            raise CommError("failed to receive reply: socket closed")
+
     def _block(self) -> None:
         if not self._sock.sock.closed.wait(30):
             raise AssertionError("nobody closed the socket within 30 s")
@@ -149,6 +164,8 @@ class FakeLogixDriver(LogixDriver):
         bind_real("open", *args, **kwargs)
         self.calls.append(("open", self._cfg["port"], self._cfg["socket_timeout"]))
         self._sock = _FakeSocketWrapper()
+        if self.controller.open_gate is not None:
+            self._wait_for(self.controller.open_gate)
         if self.controller.hang_open:
             self._block()
         if self.controller.open_errors:
@@ -204,6 +221,8 @@ class FakeLogixDriver(LogixDriver):
     def read(self, *tags: Any, **kwargs: Any) -> Tag | list[Tag]:
         bind_real("read", *tags, **kwargs)
         self.calls.append(("read", tags))
+        if self.controller.read_gate is not None:
+            self._wait_for(self.controller.read_gate)
         self._maybe_fail()
         results = []
         for request in tags:

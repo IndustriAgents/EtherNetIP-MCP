@@ -158,6 +158,8 @@ Every write result says what happened: `meta.outcome` (per entry in a batch) is 
 
 `pycomm3` reports these cases as error text, so the classification follows `pycomm3` 1.2.14's messages (the dependency is pinned below 1.3). On the JSON bridge, the mock checks a request completely before applying it, so its refusals are `rejected`.
 
+A write that has not been sent yet is also never sent after the MCP client gives up on it. This covers a write that is queued behind another call, still connecting, or waiting to retry, when the client cancels the call (`notifications/cancelled`) or disconnects (closes stdin). When the client disconnects, the server cancels every pending call, sends nothing more to the device, and exits. A write already on its way is not recalled; the client is gone, so its outcome is only in the server's log.
+
 On the CIP path, a session that has been idle for `ENIP_WRITE_PROBE_IDLE` seconds (default 10) is checked before a write with a cheap identity read. If the controller dropped it, the server reconnects first, so the write goes out once on a working session instead of failing as `unknown`.
 
 ## Known limitations

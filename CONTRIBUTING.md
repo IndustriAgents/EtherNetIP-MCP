@@ -58,7 +58,10 @@ change that breaks one of these needs a reason in the pull request:
    `ethernetip-python/.env` only, and may set `ENIP_*`/`TAG_MAP_FILE` only.
    A failed write is `rejected` only for a CIP status that refuses the
    request before execution; anything after a possible send is `unknown`.
-   Every device exchange is bounded by the overall deadline.
+   Every device exchange is bounded by the overall deadline, and a call the
+   client cancels, or that is pending when it disconnects, must never send
+   afterwards: check the call state or the client's closing flag right
+   before sending.
 4. **The mock can answer it.** If you add a tool, the mock has to be able to
    answer it, or nobody can test it without a plant.
 5. **Tool names line up with the rest of the suite.** Keep tool and argument
@@ -149,6 +152,10 @@ The test suite in `ethernetip-python/tests` has three layers:
 - **Integration tests** that start the mock and drive the real
   `ethernetip-mcp` process over stdio with the MCP client SDK, including a
   check that nothing but JSON-RPC reaches stdout.
+- **Cancellation tests** (`test_cancellation.py`): the real CLI over stdio,
+  against a fake controller the test black-holes (`blackhole_server.py`) or
+  a bridge port that comes up late, cancelling or disconnecting while a
+  write is queued, connecting or waiting to retry.
 - **A docs test** that fails if the README's configuration table misses a
   setting the code reads, or its "Behaviour changes" list misses a tool.
 

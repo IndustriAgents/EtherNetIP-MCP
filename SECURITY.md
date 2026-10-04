@@ -46,6 +46,10 @@ application on the office network.
 - **Every device exchange has a deadline.** `ENIP_DEADLINE` bounds each tool
   call; a write that runs out of time after it may have been sent is reported
   `unknown`, never retried.
+- **A cancelled write stays cancelled.** If the MCP client cancels a call or
+  disconnects before a write was sent (queued, connecting or waiting to
+  retry), the write is never sent afterwards; on disconnect the server stops
+  all pending device requests and exits.
 - **A write is sent at most once.** If its reply is lost, the server reports
   that the write may have been applied (`meta.outcome: "unknown"`,
   `meta.request_sent: true`) instead of sending it again; read the tag back
