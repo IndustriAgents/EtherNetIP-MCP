@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # The server and the mock are separate uv projects, each with its own uv.lock.
+  - package-ecosystem: uv
+    directory: /ethernetip-python
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: uv
+    directory: /ethernetip-mock-server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

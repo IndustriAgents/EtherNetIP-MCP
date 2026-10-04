@@ -5,7 +5,7 @@ description = "MCP server for Allen-Bradley EtherNet/IP controllers with tag too
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "IndustriConnect" }]
+authors = [{ name = "IndustriAgents" }]
 dependencies = [
     "anyio>=4.0.0",
     "mcp[cli]>=1.6.0",
@@ -13,6 +13,9 @@ dependencies = [
     "pycomm3>=1.2.14",
     "python-dotenv>=1.1.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/IndustriAgents/EtherNetIP-MCP"
 
 [project.optional-dependencies]
 dev = [
