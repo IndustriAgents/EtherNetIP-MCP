@@ -22,7 +22,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(slots=True)
 class ToolConfig:
-    writes_enabled: bool = True
+    writes_enabled: bool = False
     system_cmds_enabled: bool = False
     tag_map_path: Optional[Path] = None
 
@@ -30,7 +30,7 @@ class ToolConfig:
     def from_env(cls) -> "ToolConfig":
         tag_path = os.getenv("TAG_MAP_FILE")
         return cls(
-            writes_enabled=_env_bool("ENIP_WRITES_ENABLED", True),
+            writes_enabled=_env_bool("ENIP_WRITES_ENABLED", False),
             system_cmds_enabled=_env_bool("ENIP_SYSTEM_CMDS_ENABLED", False),
             tag_map_path=Path(tag_path).expanduser() if tag_path else None,
         )
