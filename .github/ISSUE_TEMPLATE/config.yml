@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Question or usage help
+    url: https://github.com/IndustriAgents/EtherNetIP-MCP/discussions
+    about: Ask about configuration, MCP clients, or connecting to your own controller.
   - name: Model Context Protocol docs
     url: https://modelcontextprotocol.io
     about: Reference for MCP itself — transports, clients, and the tool interface.
