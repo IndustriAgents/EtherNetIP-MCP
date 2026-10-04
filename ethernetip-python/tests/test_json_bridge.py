@@ -181,8 +181,16 @@ def test_mock_rejects_malformed_requests(mock_plc: MockPLC) -> None:
 async def test_write_multiple_tags_reports_each_entry(mock_plc: MockPLC) -> None:
     client = bridge(mock_plc.port)
     results, meta = await client.write_multiple_tags([("Batch_Count", 3, "DINT"), ("Line_Speed", 2, "DINT")])
-    assert results[0] == {"tag": "Batch_Count", "value": 3, "data_type": "DINT", "error": None, "outcome": "written"}
-    assert results[1]["error"] == "Tag 'Line_Speed' is REAL, not DINT" and results[1]["outcome"] == "rejected"
+    assert results[0] == {
+        "tag": "Batch_Count",
+        "value": 3,
+        "data_type": "DINT",
+        "error": None,
+        "outcome": "written",
+        "request_sent": True,
+    }
+    assert results[1]["error"] == "Tag 'Line_Speed' is REAL, not DINT"
+    assert (results[1]["outcome"], results[1]["request_sent"]) == ("rejected", True)
     assert meta["attempts"] == 2
     assert (await client.read_tag("Batch_Count"))[0]["value"] == 3
 
@@ -295,7 +303,8 @@ async def test_batch_reports_applied_entries_when_the_connection_drops() -> None
     outcomes = [(r["tag"], r["outcome"]) for r in envelope["data"]["results"]]
     assert outcomes == [("A", "written"), ("B", "unknown"), ("C", "not_sent")]
     assert "may have been applied" in envelope["data"]["results"][1]["error"]
-    assert envelope["data"]["results"][2]["error"].startswith("not attempted")
+    assert envelope["data"]["results"][2]["error"].startswith("not sent")
+    assert [r["request_sent"] for r in envelope["data"]["results"]] == [True, True, False]
 
 
 def _ipv6_loopback() -> bool:
@@ -318,3 +327,62 @@ async def test_bridge_over_ipv6() -> None:
         config = EIPClientConfig.from_env({"ENIP_JSON_BRIDGE": "true", "ENIP_HOST": f"[::1]:{port}"})
         result, _ = await EIPClient(config).read_tag("X")
     assert result["value"] == 1
+
+
+# -- outcome/request_sent and the "sent" boundary on the bridge ---------------
+
+
+async def test_bridge_write_outcomes(mock_plc: MockPLC, closed_port: int) -> None:
+    client = bridge(mock_plc.port)
+    _, meta = await client.write_tag("Batch_Count", 5)
+    assert (meta["outcome"], meta["request_sent"]) == ("written", True)
+    with pytest.raises(EIPClientError) as info:
+        await client.write_tag("Batch_Count", "five")
+    assert (info.value.meta["outcome"], info.value.meta["request_sent"]) == ("rejected", True)
+    _, meta = await client.set_plc_time()
+    assert (meta["outcome"], meta["request_sent"]) == ("written", True)
+    with pytest.raises(EIPClientError) as info:
+        await bridge(closed_port).set_plc_time()
+    assert (info.value.meta["outcome"], info.value.meta["request_sent"]) == ("not_sent", False)
+
+
+class _BrokenSendStream:
+    """A connected stream whose send() fails or never finishes."""
+
+    def __init__(self, mode: str) -> None:
+        self.mode = mode
+
+    async def __aenter__(self) -> _BrokenSendStream:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def send(self, data: bytes) -> None:
+        sends.append(data)
+        if self.mode == "hang":
+            await asyncio.sleep(30)
+        raise OSError("connection reset while sending")
+
+    async def receive(self, max_bytes: int = 65536) -> bytes:
+        raise AssertionError("receive must not be reached")
+
+
+sends: list[bytes] = []
+
+
+@pytest.mark.parametrize("mode", ["raise", "hang"])
+async def test_failure_during_send_is_unknown_and_never_retried(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """Once send() has started, part of the request may be on the wire."""
+    from ethernetip_mcp import eip_client
+
+    async def connect(host: str, port: int) -> _BrokenSendStream:
+        return _BrokenSendStream(mode)
+
+    sends.clear()
+    monkeypatch.setattr(eip_client.anyio, "connect_tcp", connect)
+    client = bridge(5025, max_retries=3, timeout=0.3)
+    with pytest.raises(OutcomeUnknownError, match="may have been applied") as info:
+        await client.write_tag("Batch_Count", 1)
+    assert info.value.meta["attempts"] == 1 and info.value.meta["request_sent"] is True
+    assert len(sends) == 1

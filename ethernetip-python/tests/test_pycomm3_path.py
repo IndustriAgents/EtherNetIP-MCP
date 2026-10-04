@@ -18,7 +18,15 @@ import pytest
 from fake_pycomm3 import REAL, FakeController, FakeLogixDriver, bind_real
 from pycomm3 import CommError, LogixDriver, RequestError
 
-from ethernetip_mcp.eip_client import MAX_BACKOFF_S, EIPClient, EIPClientConfig, EIPClientError, OutcomeUnknownError
+from ethernetip_mcp.eip_client import (
+    MAX_BACKOFF_S,
+    EIPClient,
+    EIPClientConfig,
+    EIPClientError,
+    OutcomeUnknownError,
+    check_cip_write,
+    write_error_outcome,
+)
 
 FAST = {"max_retries": 0, "retry_backoff_base": 0.0}
 
@@ -302,7 +310,16 @@ async def test_write_multiple_tags_reports_partial_failure() -> None:
 async def test_single_entry_write_multiple_tags() -> None:
     controller = FakeController()
     results, _ = await make_client(controller).write_multiple_tags([("MotorSpeed", 3.0, None)])
-    assert results == [{"tag": "MotorSpeed", "value": 3.0, "data_type": "REAL", "error": None, "outcome": "written"}]
+    assert results == [
+        {
+            "tag": "MotorSpeed",
+            "value": 3.0,
+            "data_type": "REAL",
+            "error": None,
+            "outcome": "written",
+            "request_sent": True,
+        }
+    ]
 
 
 async def test_get_tag_list_does_not_replace_pycomm3s_tag_cache() -> None:
@@ -561,3 +578,201 @@ def test_backoff_is_capped() -> None:
     assert client._backoff(1) == MAX_BACKOFF_S == 30.0
     assert max(client._backoff(n) for n in range(1, 11)) == MAX_BACKOFF_S
     assert EIPClient(EIPClientConfig(retry_backoff_base=0.5))._backoff(3) == 2.0
+
+
+# -- outcome and request_sent on every write (suite rule 1) -------------------
+
+
+def assert_outcome(meta: dict, outcome: str) -> None:
+    assert meta["outcome"] == outcome
+    assert meta["request_sent"] is (outcome != "not_sent")
+
+
+async def test_successful_write_reports_written() -> None:
+    _, meta = await make_client(FakeController()).write_tag("MotorSpeed", 5.0)
+    assert_outcome(meta, "written")
+
+
+async def test_controller_rejection_reports_rejected_and_sent() -> None:
+    controller = FakeController(write_rejections={"Batch_Count": "Privilege violation"})
+    with pytest.raises(EIPClientError, match="Privilege violation") as info:
+        await make_client(controller).write_tag("Batch_Count", 3)
+    assert_outcome(info.value.meta, "rejected")
+    assert len(controller.all_calls("write")) == 1
+
+
+async def test_unknown_tag_is_refused_before_sending() -> None:
+    controller = FakeController()
+    with pytest.raises(EIPClientError, match="refused before sending: Tag doesn't exist - Nope") as info:
+        await make_client(controller).write_tag("Nope", 3)
+    assert_outcome(info.value.meta, "not_sent")
+    assert controller.all_calls("write") == []
+
+
+async def test_local_encoding_error_is_not_sent() -> None:
+    # pycomm3 fails to encode 1.5 for a DINT before sending ("Invalid Tag Request - ...").
+    with pytest.raises(EIPClientError) as info:
+        await make_client(FakeController()).write_tag("Batch_Count", 1.5)
+    assert_outcome(info.value.meta, "not_sent")
+
+
+async def test_lost_reply_reports_unknown_and_sent() -> None:
+    controller = FakeController(reply_errors=[CommError("failed to receive reply")])
+    with pytest.raises(OutcomeUnknownError) as info:
+        await make_client(controller).write_tag("Batch_Count", 4)
+    assert_outcome(info.value.meta, "unknown")
+
+
+async def test_failed_fragmented_write_is_unknown_not_rejected() -> None:
+    controller = FakeController(write_errors_after_apply={"MotorSpeed": "One or more fragment responses failed"})
+    with pytest.raises(OutcomeUnknownError, match="may have been applied") as info:
+        await make_client(controller).write_tag("MotorSpeed", 9.0)
+    assert_outcome(info.value.meta, "unknown")
+
+
+async def test_set_plc_time_reports_outcome() -> None:
+    _, meta = await make_client(FakeController()).set_plc_time()
+    assert_outcome(meta, "written")
+    lost = FakeController(reply_errors=[CommError("failed to receive reply")])
+    with pytest.raises(OutcomeUnknownError) as info:
+        await make_client(lost).set_plc_time()
+    assert_outcome(info.value.meta, "unknown")
+    refused = FakeController(open_errors=[CommError("refused")] * 3)
+    with pytest.raises(EIPClientError) as info:
+        await make_client(refused, max_retries=1).set_plc_time()
+    assert_outcome(info.value.meta, "not_sent")
+    assert refused.set_time_calls == []
+
+
+@pytest.mark.parametrize(
+    "error, outcome",
+    [
+        ("Tag doesn't exist - X", "not_sent"),
+        ("('Failed to parse tag request', 'X')", "not_sent"),
+        ("Invalid Tag Request - RequestError('Unable to create a writable value')", "not_sent"),
+        ("Error encoding value - TypeError()", "not_sent"),
+        ("One or more fragment responses failed", "unknown"),
+        ("Invalid tag request - KeyError(0)", "unknown"),
+        ("Privilege violation", "rejected"),
+        ("Object does not exist", "rejected"),
+    ],
+)
+def test_write_error_classification(error: str, outcome: str) -> None:
+    assert write_error_outcome(error) == outcome
+
+
+# -- booleans are never written into numeric tags (suite rule 7) ----------------
+
+
+@pytest.mark.parametrize(
+    "tag, value", [("Batch_Count", True), ("MotorSpeed", False), ("Tank_Levels", [1.0, True, 2.0])]
+)
+async def test_bool_into_numeric_tag_is_refused_before_sending(tag: str, value: object) -> None:
+    controller = FakeController()
+    with pytest.raises(EIPClientError, match="a boolean is not accepted for a numeric tag") as info:
+        await make_client(controller).write_tag(tag, value)
+    assert_outcome(info.value.meta, "not_sent")
+    assert controller.all_calls("write") == []
+
+
+async def test_bool_into_bool_tag_and_bits_is_fine() -> None:
+    controller = FakeController()
+    _, meta = await make_client(controller).write_tag("Running", False)
+    assert_outcome(meta, "written")
+    driver = controller.drivers[0]
+    check_cip_write(driver, "Batch_Count.3", True)  # a bit of a DINT takes a boolean
+    check_cip_write(driver, "Batch_Count", 7)
+
+
+async def test_batch_sends_only_entries_that_pass_the_local_checks() -> None:
+    controller = FakeController()
+    results, _ = await make_client(controller).write_multiple_tags(
+        [("MotorSpeed", 1.0, None), ("Batch_Count", True, None), ("Nope", 1, None), ("Running", True, None)]
+    )
+    assert [(r["tag"], r["outcome"], r["request_sent"]) for r in results] == [
+        ("MotorSpeed", "written", True),
+        ("Batch_Count", "not_sent", False),
+        ("Nope", "not_sent", False),
+        ("Running", "written", True),
+    ]
+    assert controller.all_calls("write") == [("write", (("MotorSpeed", 1.0), ("Running", True)))]
+
+
+async def test_batch_with_nothing_sendable_sends_nothing() -> None:
+    controller = FakeController()
+    results, _ = await make_client(controller).write_multiple_tags([("Nope", 1, None), ("Batch_Count", True, None)])
+    assert [r["outcome"] for r in results] == ["not_sent", "not_sent"]
+    assert controller.all_calls("write") == []
+
+
+async def test_batch_lost_reply_marks_only_sent_entries_unknown() -> None:
+    controller = FakeController(reply_errors=[CommError("failed to receive reply")])
+    results, _ = await make_client(controller).write_multiple_tags([("MotorSpeed", 1.0, None), ("Nope", 1, None)])
+    assert [(r["outcome"], r["request_sent"]) for r in results] == [("unknown", True), ("not_sent", False)]
+
+
+async def test_batch_fragment_failure_is_unknown() -> None:
+    controller = FakeController(write_errors_after_apply={"MotorSpeed": "One or more fragment responses failed"})
+    results, _ = await make_client(controller).write_multiple_tags([("MotorSpeed", 1.0, None), ("Running", 1, None)])
+    assert [r["outcome"] for r in results] == ["unknown", "written"]
+
+
+# -- liveness probe before a write on an idle session (decision 10) ----------
+
+
+def probes(controller: FakeController) -> int:
+    return len([c for c in controller.all_calls("generic_message") if c[1] == "liveness_probe"])
+
+
+async def test_idle_dead_session_is_rebuilt_before_the_write() -> None:
+    controller = FakeController()
+    client = make_client(controller, max_retries=0, write_probe_idle=10.0)
+    await client.ensure_connection()
+    client._last_io -= 60  # the session has been idle for a minute...
+    controller.op_errors.append(CommError("socket connection broken"))  # ...and the controller dropped it
+    result, meta = await client.write_tag("Batch_Count", 11)
+    assert_outcome(meta, "written")
+    assert probes(controller) == 1
+    assert len(controller.drivers) == 2  # reconnected before writing
+    assert len(controller.all_calls("write")) == 1  # the write went out once, on the new session
+    assert controller.tags["Batch_Count"] == (11, "DINT")
+
+
+async def test_idle_live_session_is_reused_after_the_probe() -> None:
+    controller = FakeController()
+    client = make_client(controller, write_probe_idle=10.0)
+    await client.ensure_connection()
+    client._last_io -= 60
+    await client.write_tag("Batch_Count", 12)
+    assert probes(controller) == 1 and len(controller.drivers) == 1
+
+
+async def test_recently_used_session_is_not_probed() -> None:
+    controller = FakeController()
+    client = make_client(controller, write_probe_idle=10.0)
+    await client.read_tag("MotorSpeed")
+    await client.write_tag("Batch_Count", 13)
+    assert probes(controller) == 0
+
+
+async def test_probe_idle_zero_probes_before_every_write_but_not_reads() -> None:
+    controller = FakeController()
+    client = make_client(controller, write_probe_idle=0.0)
+    await client.ensure_connection()
+    await client.read_tag("MotorSpeed")
+    await client.write_tag("Batch_Count", 1)
+    await client.write_tag("Batch_Count", 2)
+    assert probes(controller) == 2
+
+
+async def test_failed_reconnect_after_probe_is_not_sent() -> None:
+    controller = FakeController()
+    client = make_client(controller, max_retries=0, write_probe_idle=10.0)
+    await client.ensure_connection()
+    client._last_io -= 60
+    controller.op_errors.append(CommError("socket connection broken"))
+    controller.open_errors.append(CommError("refused"))
+    with pytest.raises(EIPClientError) as info:
+        await client.write_tag("Batch_Count", 14)
+    assert_outcome(info.value.meta, "not_sent")
+    assert controller.all_calls("write") == []

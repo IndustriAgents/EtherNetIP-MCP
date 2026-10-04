@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
-from pydantic import Field
+from pydantic import Field, StrictInt
 
 from .eip_client import EIPClient, EIPClientError, parse_bool
 
@@ -28,13 +28,20 @@ TagName = Annotated[
         "Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
     ),
 ]
+# StrictInt: true, "2" and 2.0 are refused; booleans are never counts.
 ElementCount = Annotated[
-    int, Field(ge=1, description="Number of consecutive array elements, starting at the tag's index.")
+    StrictInt, Field(ge=1, description="Number of consecutive array elements, starting at the tag's index.")
 ]
 Alias = Annotated[str, Field(min_length=1, description="Alias defined in the TAG_MAP_FILE tag map.")]
 DataType = Annotated[str, Field(min_length=1, description="Expected Logix data type, e.g. REAL, DINT, BOOL, STRING.")]
 
 _INTEGER_TYPES = {"SINT", "INT", "DINT", "LINT", "USINT", "UINT", "UDINT", "ULINT"}
+
+# Tools that change the device. Their refusals carry outcome/request_sent too.
+WRITE_TOOLS = frozenset(
+    {"write_tag", "write_array", "write_string", "write_multiple_tags", "write_tag_by_alias", "set_plc_time"}
+)
+NOT_SENT: dict[str, Any] = {"outcome": "not_sent", "request_sent": False}
 
 
 def envelope(
@@ -143,6 +150,8 @@ def _scaling(spec: Mapping[str, Any]) -> tuple[float, float, float, float] | Non
         return None
     if not isinstance(scaling, Mapping):
         raise ValueError("'scaling' must be an object")
+    if any(isinstance(v, bool) for v in scaling.values()):
+        raise ValueError("'scaling' values must be numbers, not booleans")
     try:
         raw_min = float(scaling.get("raw_min", 0))
         raw_max = float(scaling.get("raw_max", 1))
@@ -191,7 +200,9 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
 
     def writes_refused(tool: str) -> dict[str, Any] | None:
         if not config.writes_enabled:
-            return fail("Write operations are disabled (set ENIP_WRITES_ENABLED=true to allow them)", {"tool": tool})
+            return fail(
+                "Write operations are disabled (set ENIP_WRITES_ENABLED=true to allow them)", {"tool": tool, **NOT_SENT}
+            )
         return None
 
     def system_refused(tool: str) -> dict[str, Any] | None:
@@ -208,7 +219,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(
                 f"{tool} changes the controller and is disabled: it needs ENIP_WRITES_ENABLED=true and "
                 f"ENIP_SYSTEM_CMDS_ENABLED=true (not set: {', '.join(missing)})",
-                {"tool": tool},
+                {"tool": tool, **NOT_SENT},
             )
         return None
 
@@ -237,7 +248,9 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return refused
         try:
             result, meta = await client.write_tag(tag_name, value, data_type)
-        except (EIPClientError, ValueError) as exc:
+        except ValueError as exc:  # bad input, found before anything was sent
+            return fail(str(exc), {"tool": tool, "tag_name": tag_name, **NOT_SENT})
+        except EIPClientError as exc:  # meta carries outcome and request_sent
             return fail(str(exc), _error_meta(exc, tool=tool, tag_name=tag_name))
         return ok(result, {**meta, "tool": tool, "tag_name": tag_name})
 
@@ -357,9 +370,9 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
     ) -> dict[str, Any]:
         """Write several tags in one call. Refused unless ENIP_WRITES_ENABLED=true.
 
-        data.results always has one {tag, value, data_type, error, outcome}
-        entry per payload. outcome is 'written', 'rejected' (the device
-        refused it), 'unknown' (it may have been applied but was not
+        data.results always has one {tag, value, data_type, error, outcome,
+        request_sent} entry per payload. outcome is 'written', 'rejected' (the
+        device refused it), 'unknown' (it may have been applied but was not
         confirmed; read it back) or 'not_sent'. success is true only if every
         entry was written. The writes are not atomic and are never re-sent.
         """
@@ -371,20 +384,24 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         for index, item in enumerate(payloads):
             tag = item.get("tag_name", item.get("tag"))
             if not isinstance(tag, str) or not tag.strip():
-                return fail(f"payloads[{index}] needs a non-empty 'tag_name'", {"tool": "write_multiple_tags"})
+                return fail(
+                    f"payloads[{index}] needs a non-empty 'tag_name'", {"tool": "write_multiple_tags", **NOT_SENT}
+                )
             if item.get("value") is None:
-                return fail(f"payloads[{index}] ({tag}) needs a 'value'", {"tool": "write_multiple_tags"})
+                return fail(f"payloads[{index}] ({tag}) needs a 'value'", {"tool": "write_multiple_tags", **NOT_SENT})
             if tag.strip() in seen:
-                return fail(f"payloads lists '{tag}' more than once", {"tool": "write_multiple_tags"})
+                return fail(f"payloads lists '{tag}' more than once", {"tool": "write_multiple_tags", **NOT_SENT})
             data_type = item.get("data_type")
             if data_type is not None and (not isinstance(data_type, str) or not data_type.strip()):
-                return fail(f"payloads[{index}] ({tag}) has an invalid 'data_type'", {"tool": "write_multiple_tags"})
+                return fail(
+                    f"payloads[{index}] ({tag}) has an invalid 'data_type'", {"tool": "write_multiple_tags", **NOT_SENT}
+                )
             seen.add(tag.strip())
             items.append((tag.strip(), item["value"], data_type))
         try:
             results, meta = await client.write_multiple_tags(items)
-        except (EIPClientError, ValueError) as exc:
-            return fail(str(exc), _error_meta(exc, tool="write_multiple_tags"))
+        except ValueError as exc:  # bad input, found before anything was sent
+            return fail(str(exc), {"tool": "write_multiple_tags", **NOT_SENT})
         meta = {**meta, "count": len(results)}
         failed = [r for r in results if r["outcome"] != "written"]
         if failed:
@@ -434,6 +451,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return refused
         spec, error = alias_spec(alias, "write_tag_by_alias")
         if error:
+            error["meta"].update(NOT_SENT)
             return error
         try:
             scaling = _scaling(spec)
@@ -441,7 +459,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             if scaling is not None:
                 raw = _round_for_type(raw, spec.get("data_type"))
         except ValueError as exc:
-            return fail(f"Alias '{alias}': {exc}", {"tool": "write_tag_by_alias", "alias": alias})
+            return fail(f"Alias '{alias}': {exc}", {"tool": "write_tag_by_alias", "alias": alias, **NOT_SENT})
         response = await do_write("write_tag_by_alias", spec["tag"], raw, spec.get("data_type"))
         if not response["success"]:
             return response

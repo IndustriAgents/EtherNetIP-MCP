@@ -163,6 +163,10 @@ async def test_set_plc_time_needs_both_gates(writes: bool, system: bool, missing
         ("read_multiple_tags", {"tags": "MotorSpeed"}, "tags"),
         ("write_multiple_tags", {"payloads": ["MotorSpeed"]}, "payloads"),
         ("get_tag_list", {"program": ""}, "program"),
+        ("read_array", {"tag_name": "Tank_Levels", "elements": True}, "elements"),
+        ("read_array", {"tag_name": "Tank_Levels", "elements": "2"}, "elements"),
+        ("read_array", {"tag_name": "Tank_Levels", "elements": 2.0}, "elements"),
+        ("read_tag", {"tag_name": "Tank_Levels", "count": True}, "count"),
         ("read_tag_by_alias", {"alias": ""}, "alias"),
     ],
 )
@@ -256,8 +260,12 @@ async def test_batch_partial_failures_are_failures() -> None:
     assert reads["success"] is False and reads["error"].startswith("1 of 2 reads failed: Nope")
     assert reads["data"]["results"][0]["value"] == 1450.0
     assert writes["success"] is False
-    assert writes["error"].startswith("1 of 2 writes were not confirmed: Nope (rejected)")
-    assert [r["outcome"] for r in writes["data"]["results"]] == ["written", "rejected"]
+    # pycomm3 knows the controller's tags, so an unknown tag is refused before sending.
+    assert writes["error"].startswith("1 of 2 writes were not confirmed: Nope (not_sent)")
+    assert [(r["outcome"], r["request_sent"]) for r in writes["data"]["results"]] == [
+        ("written", True),
+        ("not_sent", False),
+    ]
     assert writes["data"]["results"][0]["error"] is None
 
 
@@ -370,3 +378,49 @@ async def test_lost_write_reply_is_reported_as_unknown_outcome() -> None:
     assert envelope["success"] is False and "may have been applied" in envelope["error"]
     assert envelope["meta"]["outcome"] == "unknown"
     assert len(controller.all_calls("write")) == 1
+
+
+async def test_write_refusals_say_nothing_was_sent(tag_map_file: Path) -> None:
+    cases = [
+        (session(), "write_tag", {"tag_name": "MotorSpeed", "value": 1.0}),  # writes disabled
+        (session(writes=True), "set_plc_time", {}),  # system commands disabled
+        (session(writes=True), "write_tag", {"tag_name": "MotorSpeed"}),  # invalid arguments
+        (session(writes=True), "write_tag", {"tag_name": "MotorSpeed", "value": None}),  # no value
+        (session(writes=True), "write_multiple_tags", {"payloads": [{"value": 1}]}),  # bad payload
+        (session(writes=True, tag_map=tag_map_file), "write_tag_by_alias", {"alias": "nope", "value": 1}),
+        (session(writes=True, tag_map=tag_map_file), "write_tag_by_alias", {"alias": "flat", "value": 1}),
+    ]
+    for context, tool, arguments in cases:
+        async with context as s:
+            envelope = await call(s, tool, arguments)
+        assert envelope["success"] is False, (tool, arguments)
+        assert envelope["meta"]["outcome"] == "not_sent" and envelope["meta"]["request_sent"] is False, (
+            tool,
+            arguments,
+        )
+
+
+async def test_successful_writes_report_outcome() -> None:
+    async with session(writes=True, system=True) as s:
+        written = await call(s, "write_tag", {"tag_name": "MotorSpeed", "value": 2.0})
+        clock = await call(s, "set_plc_time")
+    for envelope in (written, clock):
+        assert envelope["success"] is True
+        assert envelope["meta"]["outcome"] == "written" and envelope["meta"]["request_sent"] is True
+
+
+async def test_bool_is_not_written_into_a_dint() -> None:
+    controller = FakeController()
+    async with session(controller, writes=True) as s:
+        envelope = await call(s, "write_tag", {"tag_name": "Batch_Count", "value": True})
+    assert envelope["success"] is False and "a boolean is not accepted" in envelope["error"]
+    assert envelope["meta"]["outcome"] == "not_sent"
+    assert controller.all_calls("write") == []
+
+
+async def test_bool_scaling_values_are_refused(tmp_path: Path) -> None:
+    path = tmp_path / "tags.json"
+    path.write_text(json.dumps({"x": {"tag": "MotorSpeed", "scaling": {"raw_min": 0, "raw_max": True}}}))
+    async with session(tag_map=path) as s:
+        envelope = await call(s, "read_tag_by_alias", {"alias": "x"})
+    assert envelope["success"] is False and "not booleans" in envelope["error"]

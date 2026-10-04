@@ -61,6 +61,10 @@ class FakeController:
     op_errors: list[BaseException] = field(default_factory=list)
     # Raised after a write/set_plc_time was applied: the reply was lost.
     reply_errors: list[BaseException] = field(default_factory=list)
+    # Errors the controller reports for a write to a tag (request_sent, rejected).
+    write_rejections: dict[str, str] = field(default_factory=dict)
+    # Tag.error returned (after applying) for a write, e.g. a fragmented write.
+    write_errors_after_apply: dict[str, str] = field(default_factory=dict)
     drivers: list[FakeLogixDriver] = field(default_factory=list)
     set_time_calls: list[int | None] = field(default_factory=list)
 
@@ -122,6 +126,26 @@ class FakeLogixDriver(LogixDriver):
         self._micro800 = self.controller.product_name.startswith("2080")
         return True
 
+    def get_tag_info(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        """Like pycomm3: answered from the uploaded definitions, no network I/O."""
+        bound = bind_real("get_tag_info", *args, **kwargs)
+        name = bound.arguments["tag_name"]
+        self.calls.append(("get_tag_info", name))
+        base = re.sub(r"\[\d+\]$", "", name)
+        if base not in self.controller.tags or (self._visible is not None and base not in self._visible):
+            from pycomm3 import RequestError
+
+            raise RequestError(f"Tag doesn't exist - {base}")
+        _, data_type = self.controller.tags[base]
+        array = _ARRAY.match(data_type)
+        return {"tag_name": base, "data_type_name": array.group("base") if array else data_type, "tag_type": "atomic"}
+
+    def generic_message(self, *args: Any, **kwargs: Any) -> Tag:
+        bound = bind_real("generic_message", *args, **kwargs)
+        self.calls.append(("generic_message", bound.arguments.get("name")))
+        self._maybe_fail()
+        return Tag(bound.arguments.get("name", "generic"), b"\x01\x00", None, None)
+
     def close(self, *args: Any, **kwargs: Any) -> None:
         bind_real("close", *args, **kwargs)
         self.calls.append(("close",))
@@ -163,6 +187,9 @@ class FakeLogixDriver(LogixDriver):
             except KeyError as exc:
                 results.append(Tag(tag, None, None, f"Tag doesn't exist - {exc.args[0]}"))
                 continue
+            if base in self.controller.write_rejections:
+                results.append(Tag(base, None, None, self.controller.write_rejections[base]))
+                continue
             array = _ARRAY.match(data_type)
             if array:
                 elements = count or 1
@@ -179,7 +206,7 @@ class FakeLogixDriver(LogixDriver):
                 results.append(Tag(base, value, None, "Invalid Tag Request - Unable to create a writable value"))
                 continue
             self.controller.tags[base] = (value, data_type)
-            results.append(Tag(base, value, data_type, None))
+            results.append(Tag(base, value, data_type, self.controller.write_errors_after_apply.get(base)))
         self._maybe_lose_reply()
         return results if len(tags_values) > 1 else results[0]
 

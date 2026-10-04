@@ -14,7 +14,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from pydantic import ValidationError
 
 from .eip_client import EIPClient
-from .tools import TagMap, ToolConfig, ToolResources, fail, register_tools
+from .tools import NOT_SENT, WRITE_TOOLS, TagMap, ToolConfig, ToolResources, fail, register_tools
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,8 @@ class EnvelopeFastMCP(FastMCP):
             metadata.arg_model.model_validate(metadata.pre_parse_json(arguments or {}))
         except ValidationError as exc:
             message = f"Invalid arguments for {name}: {_describe_validation_error(exc)}"
-            return metadata.convert_result(fail(message, {"tool": name}))
+            meta = {"tool": name, **(NOT_SENT if name in WRITE_TOOLS else {})}
+            return metadata.convert_result(fail(message, meta))
         try:
             return await super().call_tool(name, arguments)
         except ToolError as exc:

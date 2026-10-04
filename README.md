@@ -94,6 +94,7 @@ Set these in the client config's `env`, in the environment, or in a `.env` file 
 | `ENIP_RETRY_BACKOFF_BASE` | `0.5` | Base delay of the retry backoff, in seconds (0–60): retry *n* waits this × 2<sup>n−1</sup>, capped at 30 s per wait. |
 | `ENIP_WRITES_ENABLED` | `false` | Allows the write tools, and is one of the two settings `set_plc_time` needs. Off by default: a model will call a tool it has been given. |
 | `ENIP_SYSTEM_CMDS_ENABLED` | `false` | Allows system commands. `set_plc_time` changes the controller, so it needs both this and `ENIP_WRITES_ENABLED=true`. |
+| `ENIP_WRITE_PROBE_IDLE` | `10` | Seconds. Before a write or `set_plc_time` on a CIP session idle at least this long, read the controller's identity first (a liveness probe that is safe to repeat); if that fails, reconnect, then send the write once. `0` probes before every write. |
 | `ENIP_DEBUG` | `false` | Debug logging, including `pycomm3`'s, on stderr. |
 | `TAG_MAP_FILE` | unset | JSON file of tag aliases with optional scaling, used by `list_tags` and the `*_by_alias` tools. |
 
