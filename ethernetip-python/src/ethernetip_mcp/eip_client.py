@@ -73,11 +73,23 @@ class _NotSentError(EIPClientError):
 
 
 class _CallStopped(Exception):
-    """Raised in a worker thread so it stops before sending anything.
+    """Raised so a call stops before sending anything.
 
-    Either its call is over (the deadline expired, or the MCP client cancelled
-    the call or disconnected), or the client as a whole is shutting down.
+    ``reason`` is "deadline" (the call's absolute deadline has passed),
+    "closing" (the MCP client disconnected) or "cancelled" (the client
+    cancelled the call, which then no longer waits for the worker).
     """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+_STOP_DETAIL = {
+    "deadline": "the call's deadline (ENIP_DEADLINE) was reached before the request was sent",
+    "closing": "the MCP client disconnected before the request was sent",
+    "cancelled": "the call was cancelled before the request was sent",
+}
 
 
 class _CallState:
@@ -88,21 +100,34 @@ class _CallState:
     knows the request may have been sent) or never sends it at all.
     """
 
-    def __init__(self, closing: Callable[[], bool] = lambda: False) -> None:
+    def __init__(self, closing: Callable[[], bool] = lambda: False, not_after: float | None = None) -> None:
         self._guard = threading.Lock()
         self._closing = closing
+        self.not_after = not_after  # time.monotonic() after which nothing may be sent
         self.phase = "open"
         self.cancelled = False
         self.holding_session = False
 
+    def _stop_reason(self) -> str | None:
+        if self.cancelled:
+            return "cancelled"
+        if self._closing():
+            return "closing"
+        if self.not_after is not None and time.monotonic() >= self.not_after:
+            return "deadline"
+        return None
+
     def check(self) -> None:
-        if self.cancelled or self._closing():
-            raise _CallStopped
+        reason = self._stop_reason()
+        if reason:
+            raise _CallStopped(reason)
 
     def enter_operation(self) -> None:
+        """The last check before sending: no I/O between it and the send."""
         with self._guard:
-            if self.cancelled or self._closing():
-                raise _CallStopped
+            reason = self._stop_reason()
+            if reason:
+                raise _CallStopped(reason)
             self.phase = "operation"
 
     def set_holding(self, holding: bool) -> None:
@@ -726,7 +751,7 @@ class EIPClient:
         if self.config.json_bridge or self._closing:
             return
         deadline = self.config.deadline_s()
-        state = _CallState(lambda: self._closing)
+        state = _CallState(lambda: self._closing, time.monotonic() + deadline)
         try:
             try:
                 with anyio.fail_after(deadline):
@@ -784,13 +809,29 @@ class EIPClient:
             raise ValueError("tags must contain at least one tag name")
         parsed = [split_element_count(tag, None) for tag in tags]
         if self.config.json_bridge:
+            # One deadline for the whole call, shared by every tag's request.
+            not_after = self.call_deadline()
             results = []
             attempts = 0
+            stopped: str | None = None
             for base, count in parsed:
+                if stopped is not None:
+                    results.append({"tag": base, "value": None, "data_type": None, "error": stopped})
+                    continue
                 payload: dict[str, Any] = {"op": "read", "tag": base}
                 if count is not None:
                     payload["count"] = count
-                response, meta = await self._json_exchange(f"read_tag({base})", payload)
+                try:
+                    response, meta = await self._json_exchange(f"read_tag({base})", payload, not_after=not_after)
+                except EIPClientError as exc:
+                    attempts += exc.meta.get("attempts", 1)
+                    results.append({"tag": base, "value": None, "data_type": None, "error": str(exc)})
+                    stopped = (
+                        "not read: the call's deadline (ENIP_DEADLINE) was reached"
+                        if time.monotonic() >= not_after
+                        else f"not read: the batch stopped after the connection failed on {base}"
+                    )
+                    continue
                 attempts += meta.get("attempts", 1)
                 if response.get("success"):
                     data = response.get("data") or {}
@@ -993,6 +1034,8 @@ class EIPClient:
     async def _json_write_multiple(
         self, prepared: list[tuple[str, str, Any, str | None]]
     ) -> tuple[list[dict[str, Any]], OperationMeta]:
+        # One deadline for the whole call: entries not sent by then are not_sent.
+        not_after = self.call_deadline()
         results: list[dict[str, Any]] = []
         attempts = 0
         stopped: str | None = None
@@ -1004,11 +1047,17 @@ class EIPClient:
             if data_type:
                 payload["data_type"] = data_type
             try:
-                response, meta = await self._json_exchange(f"write_tag({base})", payload, repeatable=False)
+                response, meta = await self._json_exchange(
+                    f"write_tag({base})", payload, repeatable=False, not_after=not_after
+                )
             except EIPClientError as exc:
                 attempts += exc.meta.get("attempts", 1)
                 results.append(_entry(base, value, None, str(exc), exc.meta.get("outcome", "unknown")))
-                stopped = f"not sent: the batch stopped after the connection failed on {base}"
+                stopped = (
+                    "not sent: the call's deadline (ENIP_DEADLINE) was reached before sending"
+                    if time.monotonic() >= not_after
+                    else f"not sent: the batch stopped after the connection failed on {base}"
+                )
                 continue
             attempts += meta.get("attempts", 1)
             if response.get("success"):
@@ -1306,8 +1355,8 @@ class EIPClient:
         and a write is reported unknown if it may have been sent, not_sent if
         it was still connecting. The socket is closed to stop the worker.
         """
-        state = _CallState(lambda: self._closing)
         deadline = self.config.deadline_s()
+        state = _CallState(lambda: self._closing, time.monotonic() + deadline)
         start = time.perf_counter()
         try:
             with anyio.fail_after(deadline):
@@ -1315,9 +1364,9 @@ class EIPClient:
                     self._execute_sync, label, operation, repeatable, state, abandon_on_cancel=True
                 )
         except _CallStopped as exc:
-            # The worker refused to start or to send: the MCP client is gone.
+            # The worker refused to start or to send: the deadline passed or the client is gone.
             meta: OperationMeta = {"backend": "cip", "duration_ms": round((time.perf_counter() - start) * 1000.0, 3)}
-            detail = "the MCP client disconnected before the request was sent"
+            detail = _STOP_DETAIL.get(exc.reason, exc.reason)
             raise EIPClientError(
                 f"{label} stopped: {detail}", meta if repeatable else with_outcome(meta, "not_sent")
             ) from exc
@@ -1350,17 +1399,19 @@ class EIPClient:
 
     # -- JSON bridge internals -----------------------------------------------
 
-    async def _json_request(self, payload: dict[str, Any], progress: dict[str, bool]) -> dict[str, Any]:
+    async def _json_request(
+        self, payload: dict[str, Any], progress: dict[str, bool], not_after: float | None = None
+    ) -> dict[str, Any]:
         """One request/reply. Sets ``progress["sent"]`` once bytes may have left."""
         address = self._address
+        self._refuse_if_stopped(not_after)  # before connecting
         try:
             stream = await anyio.connect_tcp(self.config.host, self.config.port)
         except Exception as exc:
             raise _TransientError(f"cannot reach the JSON bridge at {address}: {_describe(exc)}") from exc
         raw = b""
         async with stream:
-            if self._closing:  # checked with no await before the send starts
-                raise _CallStopped
+            self._refuse_if_stopped(not_after)  # with no await between this check and the send
             try:
                 progress["sent"] = True
                 await stream.send(json.dumps(payload).encode("utf-8") + b"\n")
@@ -1387,32 +1438,43 @@ class EIPClient:
             raise EIPClientError(f"JSON bridge at {address} sent a reply that is not an object")
         return response
 
+    def _refuse_if_stopped(self, not_after: float | None) -> None:
+        if self._closing:
+            raise _CallStopped("closing")
+        if not_after is not None and time.monotonic() >= not_after:
+            raise _CallStopped("deadline")
+
+    def call_deadline(self) -> float:
+        """The absolute deadline (time.monotonic()) for a tool call starting now."""
+        return time.monotonic() + self.config.deadline_s()
+
     async def _json_exchange(
-        self, label: str, payload: dict[str, Any], repeatable: bool = True
+        self, label: str, payload: dict[str, Any], repeatable: bool = True, not_after: float | None = None
     ) -> tuple[dict[str, Any], OperationMeta]:
         """Send one request.
 
         Failing to connect is retried. Once the request may have been sent it
         is repeated only if ``repeatable``; a write whose reply is lost is
         reported as possibly applied instead (``OutcomeUnknownError``). Each
-        attempt is limited by ENIP_TIMEOUT and the whole exchange, retries
-        included, by the overall deadline (ENIP_DEADLINE).
+        attempt is limited by ENIP_TIMEOUT, and everything by ``not_after``:
+        the tool call's single absolute deadline, shared by every request the
+        call makes (a batch passes the same one to each entry). Nothing is
+        connected or sent once it has passed.
         """
         start = time.perf_counter()
-        deadline = self.config.deadline_s()
+        not_after = self.call_deadline() if not_after is None else not_after
         attempts = 0
         while True:
             attempts += 1
             progress = {"sent": False}
-            limit = min(self.config.timeout, max(deadline - (time.perf_counter() - start), 0.0))
+            limit = max(min(self.config.timeout, not_after - time.monotonic()), 0.0)
             try:
-                if self._closing:
-                    raise _CallStopped
+                self._refuse_if_stopped(not_after)
                 with anyio.fail_after(limit):
-                    response = await self._json_request(payload, progress)
-            except _CallStopped:
+                    response = await self._json_request(payload, progress, not_after)
+            except _CallStopped as stopped:
                 meta = {"backend": "json_bridge", "attempts": attempts}
-                detail = "the MCP client disconnected before the request was sent"
+                detail = _STOP_DETAIL.get(stopped.reason, stopped.reason)
                 raise EIPClientError(
                     f"{label} stopped: {detail}", meta if repeatable else with_outcome(meta, "not_sent")
                 ) from None
@@ -1445,7 +1507,7 @@ class EIPClient:
                 ) from failure
             transient = isinstance(failure, _TransientError)
             delay = self._backoff(attempts)
-            in_time = (time.perf_counter() - start) + delay < deadline
+            in_time = time.monotonic() + delay < not_after
             if transient and attempts <= self.config.max_retries and in_time:
                 await anyio.sleep(delay)
                 continue

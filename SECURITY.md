@@ -44,7 +44,8 @@ application on the office network.
   letter case. Enable writes in the MCP client's `env`, or in a file you pass
   explicitly with `--env-file`.
 - **Every device exchange has a deadline.** `ENIP_DEADLINE` bounds each tool
-  call; a write that runs out of time after it may have been sent is reported
+  call from its start, batches included; nothing is sent once it has passed.
+  A write that runs out of time after it may have been sent is reported
   `unknown`, never retried.
 - **A cancelled write stays cancelled.** If the MCP client cancels a call or
   disconnects before a write was sent (queued, connecting or waiting to

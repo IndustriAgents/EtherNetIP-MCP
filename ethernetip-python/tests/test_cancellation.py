@@ -421,3 +421,121 @@ async def test_bridge_shutdown_during_backoff_stops_retries(closed_port: int) ->
         await anyio.sleep(0.1)  # first attempt refused, now waiting to retry
         client.shutdown()
     assert attempts == [2]  # the retry stopped at the closing check
+
+
+# -- one absolute deadline per tool call (rules 1 and 12, clarified) ----------
+
+
+class SlowDevice:
+    """A JSON bridge that applies each request at once and answers 1.5 s later."""
+
+    def __init__(self) -> None:
+        self.arrivals: list[tuple[float, str]] = []
+        self.port = 0
+        self._server: Any = None
+
+    async def __aenter__(self) -> SlowDevice:
+        async def handle(reader: Any, writer: Any) -> None:
+            line = await reader.readline()
+            if not line:
+                return
+            request = json.loads(line)
+            self.arrivals.append((time.monotonic(), request.get("tag")))
+            await anyio.sleep(1.5)
+            data = {"tag": request.get("tag"), "value": request.get("value", 1), "data_type": "DINT"}
+            try:
+                writer.write(json.dumps({"success": True, "data": data}).encode() + b"\n")
+                await writer.drain()
+            except (ConnectionError, OSError):
+                pass
+            writer.close()
+
+        import asyncio
+
+        self._server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        self._server.close()
+
+
+def slow_bridge(port: int) -> EIPClient:
+    return EIPClient(EIPClientConfig(port=port, json_bridge=True, timeout=5.0, max_retries=0, deadline=2.0))
+
+
+async def test_batch_write_shares_one_deadline() -> None:
+    async with SlowDevice() as device:
+        client = slow_bridge(device.port)
+        start = time.monotonic()
+        results, _ = await client.write_multiple_tags([("A", 1, None), ("B", 2, None), ("C", 3, None)])
+        took = time.monotonic() - start
+        await anyio.sleep(2.0)  # anything sent late would arrive by now
+    assert took < 2.6  # the call answered by its deadline
+    assert [(r["tag"], r["outcome"], r["request_sent"]) for r in results] == [
+        ("A", "written", True),
+        ("B", "unknown", True),  # in flight when the deadline passed
+        ("C", "not_sent", False),
+    ]
+    assert "deadline" in results[2]["error"]
+    assert [tag for _, tag in device.arrivals] == ["A", "B"]
+    assert all(at - start < 2.0 for at, _ in device.arrivals)  # nothing reached the device after the deadline
+
+
+async def test_batch_read_shares_one_deadline() -> None:
+    async with SlowDevice() as device:
+        client = slow_bridge(device.port)
+        start = time.monotonic()
+        results, _ = await client.read_multiple_tags(["A", "B", "C"])
+        took = time.monotonic() - start
+        await anyio.sleep(2.0)
+    assert took < 2.6
+    assert results[0]["error"] is None
+    assert results[1]["error"] and results[2]["error"].startswith("not read: the call's deadline")
+    assert [tag for _, tag in device.arrivals] == ["A", "B"]
+
+
+async def test_bridge_send_is_refused_once_the_deadline_has_passed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A connect that returns after the deadline (without yielding) must not lead to a send."""
+    from ethernetip_mcp import eip_client
+
+    sent: list[bytes] = []
+
+    class Stream:
+        async def __aenter__(self) -> Stream:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def send(self, data: bytes) -> None:
+            sent.append(data)
+
+    async def slow_connect(host: str, port: int) -> Stream:
+        time.sleep(0.4)  # blocks past the 0.2 s deadline; nothing can cancel it
+        return Stream()
+
+    monkeypatch.setattr(eip_client.anyio, "connect_tcp", slow_connect)
+    client = EIPClient(EIPClientConfig(port=5025, json_bridge=True, max_retries=0, deadline=0.2))
+    with pytest.raises(EIPClientError, match="deadline") as info:
+        await client.write_tag("Batch_Count", 5)
+    assert info.value.meta["outcome"] == "not_sent"
+    assert sent == []
+
+
+def test_cip_worker_refuses_to_send_after_the_deadline() -> None:
+    """The worker checks the call's absolute deadline itself, right before sending."""
+    from ethernetip_mcp.eip_client import _CallState, _CallStopped
+
+    controller = FakeController()
+    client = make_client(controller)
+    client._connect_once()
+    sent: list[str] = []
+    expired = _CallState(not_after=time.monotonic() - 0.001)
+    with pytest.raises(_CallStopped) as info:
+        client._execute_sync("write_tag(X)", lambda driver: sent.append("sent"), repeatable=False, state=expired)
+    assert info.value.reason == "deadline"
+    assert sent == []
+    alive = _CallState(not_after=time.monotonic() + 5)
+    client._execute_sync("write_tag(X)", lambda driver: sent.append("sent"), repeatable=False, state=alive)
+    assert sent == ["sent"]
