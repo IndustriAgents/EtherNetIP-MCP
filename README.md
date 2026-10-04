@@ -81,7 +81,12 @@ For a real controller, drop `ENIP_JSON_BRIDGE` and `ENIP_PORT`, and set `ENIP_HO
 
 Set these in the client config's `env` or the process environment. The server reads them when it starts; an invalid value (a port that is not a number, `ENIP_WRITES_ENABLED=ture`, conflicting settings) stops the server at startup with a `configuration error` message on stderr and exit code 2. An empty value counts as unset.
 
-**`.env` files cannot turn on writes.** Connection settings may also come from a `.env` file: the server uses the first one it finds walking up from its package directory (for a source checkout, `ethernetip-python/.env`, then the repository root). Such an automatically found file may **not** enable a safety switch: `ENIP_WRITES_ENABLED` and `ENIP_SYSTEM_CMDS_ENABLED` in it are ignored, with a warning on stderr naming the variable. The search can reach files nobody wrote for this server, such as a project's `.env` in a parent directory. Set the switches in the client config's `env`, or put them in a file you name explicitly: `ethernetip-mcp --env-file /path/to/eip.env` honours every setting in that file. Variables already set in the environment always win over either file. [`ethernetip-python/.env.example`](ethernetip-python/.env.example) lists the settings.
+**Where settings come from.** The server reads the process environment (the MCP client's `env`) and, optionally, two kinds of file:
+
+- `ethernetip-mcp --env-file PATH` reads the file you name, and honours every setting in it, safety switches included.
+- Without `--env-file`, the server loads one `.env` by itself, and only `ethernetip-python/.env` of a source checkout. It looks in that project directory, found from the package's own location, and **never** in the working directory or a parent directory; an installed package (site-packages) has no implicit `.env` at all. The working directory is usually the MCP client's project, which this server should not trust, and settings such as the host or the tag map decide where a write goes. Even that file may only set this server's own settings (`ENIP_*` and `TAG_MAP_FILE`) and may **not** enable a safety switch: `ENIP_WRITES_ENABLED`, `ENIP_SYSTEM_CMDS_ENABLED` and any other variable in it (`PATH`, `PYTHONPATH`, `LD_PRELOAD`, proxy settings, …) are ignored with a warning on stderr naming the variable. Names are compared case-insensitively, as Windows does, and an `export` prefix makes no difference.
+
+Variables already set in the environment always win over either file. [`ethernetip-python/.env.example`](ethernetip-python/.env.example) lists the settings.
 
 | Variable | Default | Meaning |
 |---|---|---|

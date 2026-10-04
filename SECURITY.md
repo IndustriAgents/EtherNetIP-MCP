@@ -33,13 +33,16 @@ application on the office network.
 - **Leave system commands off.** `set_plc_time` changes the controller, so it
   is refused unless both `ENIP_WRITES_ENABLED=true` and
   `ENIP_SYSTEM_CMDS_ENABLED=true`. Keep it that way unless you need it.
-- **Safety switches never come from an automatic `.env`.** The server reads a
-  `.env` it finds by itself (walking up from its package directory) for
-  connection settings only. `ENIP_WRITES_ENABLED` and
-  `ENIP_SYSTEM_CMDS_ENABLED` in such a file are ignored, with a warning on
-  stderr, because the search can reach files nobody wrote for this server.
-  Enable writes in the MCP client's `env`, or in a file you pass explicitly
-  with `--env-file`.
+- **Safety switches never come from an implicit `.env`.** Without
+  `--env-file`, the server loads only `ethernetip-python/.env` of a source
+  checkout, found from the package's own location: never the working
+  directory (usually the MCP client's project) or any parent directory, and
+  nothing at all for an installed package. That file may set only `ENIP_*`
+  and `TAG_MAP_FILE` settings; `ENIP_WRITES_ENABLED`,
+  `ENIP_SYSTEM_CMDS_ENABLED` and anything else in it (`PATH`, `PYTHONPATH`,
+  `LD_PRELOAD`, …) are ignored with a warning on stderr, whatever their
+  letter case. Enable writes in the MCP client's `env`, or in a file you pass
+  explicitly with `--env-file`.
 - **A write is sent at most once.** If its reply is lost, the server reports
   that the write may have been applied (`meta.outcome: "unknown"`,
   `meta.request_sent: true`) instead of sending it again; read the tag back

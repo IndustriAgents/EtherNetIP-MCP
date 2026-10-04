@@ -28,7 +28,7 @@ ENIP_HOST=127.0.0.1 ENIP_PORT=5025 ENIP_JSON_BRIDGE=true uv run ethernetip-mcp
 
 The server speaks MCP over stdio, so it waits for a client on stdin; its logs go to stderr. Configure it with environment variables; the full list is in the [Configuration](../README.md#configuration) section of the top-level README, and [`.env.example`](.env.example) shows them all.
 
-A `.env` file in this directory (or a parent) is read automatically, but only for connection settings: `ENIP_WRITES_ENABLED` and `ENIP_SYSTEM_CMDS_ENABLED` in an automatically found `.env` are ignored, with a warning on stderr. Set those in the MCP client's `env`, or pass a file explicitly with `uv run ethernetip-mcp --env-file /path/to/eip.env`, which honours every setting in it. Write tools are refused unless `ENIP_WRITES_ENABLED=true`.
+A `.env` file in this directory (`ethernetip-python/.env`) is read automatically, but only for this server's own connection settings (`ENIP_*`, `TAG_MAP_FILE`). No other `.env` is read implicitly: not one in the working directory, not one in a parent directory, and none at all when the package is installed rather than run from this checkout. `ENIP_WRITES_ENABLED`, `ENIP_SYSTEM_CMDS_ENABLED` and any other variable in the automatic `.env` are ignored, with a warning on stderr. Set the switches in the MCP client's `env`, or pass a file explicitly with `uv run ethernetip-mcp --env-file /path/to/eip.env`, which honours every setting in it. Write tools are refused unless `ENIP_WRITES_ENABLED=true`.
 
 ## Layout
 
