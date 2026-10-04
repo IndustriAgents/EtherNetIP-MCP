@@ -8,9 +8,11 @@ license = { text = "MIT" }
 authors = [{ name = "IndustriAgents" }]
 dependencies = [
     "anyio>=4.0.0",
-    "mcp[cli]>=1.6.0",
+    # mcp 2.x renamed FastMCP and moved its modules; this server targets 1.x.
+    "mcp[cli]>=1.22.0,<2",
     "pydantic>=2.6.0",
-    "pycomm3>=1.2.14",
+    # eip_client.py sets pycomm3's _cfg["socket_timeout"]; re-check on upgrades.
+    "pycomm3>=1.2.14,<1.3",
     "python-dotenv>=1.1.0",
 ]
 
@@ -30,3 +32,18 @@ ethernetip-mcp = "ethernetip_mcp.cli:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "integration: starts the mock PLC and drives the MCP server over stdio",
+]

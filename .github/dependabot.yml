@@ -6,6 +6,14 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # mcp 2.x renamed FastMCP and moved its modules; pyproject pins mcp<2.
+      # Porting to 2.x is its own change, not a lockfile bump.
+      - dependency-name: mcp
+        update-types: ["version-update:semver-major"]
+      # eip_client.py relies on pycomm3 1.2 internals (_cfg["socket_timeout"]).
+      - dependency-name: pycomm3
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
 
   - package-ecosystem: uv
     directory: /ethernetip-mock-server
