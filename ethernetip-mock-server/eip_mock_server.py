@@ -84,9 +84,12 @@ class TagEntry:
 def _coerce(tag: str, base_type: str, value: Any) -> Any:
     """Check a value against a Logix type the way a controller would refuse it."""
     if base_type == "BOOL":
+        # pycomm3 encodes any truthy value as 0xFF; the mock accepts the common forms.
         if isinstance(value, bool):
             return value
-        raise MockError(f"Tag '{tag}' is BOOL; expected true or false, got {value!r}")
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        raise MockError(f"Tag '{tag}' is BOOL; expected true/false or 1/0, got {value!r}")
     if base_type == "REAL":
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise MockError(f"Tag '{tag}' is REAL; expected a number, got {value!r}")
@@ -283,8 +286,18 @@ class MockEtherNetIPServer:
             value, data_type = self.tags.write(request.get("tag"), request.get("value"), request.get("data_type"))
             return {"tag": request["tag"], "value": value, "data_type": data_type}
         if op == "list":
+            # Same keys the server returns for a real controller's tag list.
             return [
-                {"tag": e.name, "value": e.value, "data_type": e.data_type, "description": e.description}
+                {
+                    "tag": e.name,
+                    "data_type": e.base_type,
+                    "dimensions": [e.length] if e.length is not None else [],
+                    "tag_type": "atomic",
+                    "alias": False,
+                    "external_access": "Read/Write" if e.mutable else "Read Only",
+                    "description": e.description,
+                    "value": e.value,
+                }
                 for e in self.tags.list(request.get("program"))
             ]
         if op == "info":
