@@ -18,7 +18,7 @@ import pytest
 from fake_pycomm3 import REAL, FakeController, FakeLogixDriver, bind_real
 from pycomm3 import CommError, LogixDriver, RequestError
 
-from ethernetip_mcp.eip_client import EIPClient, EIPClientConfig, EIPClientError
+from ethernetip_mcp.eip_client import MAX_BACKOFF_S, EIPClient, EIPClientConfig, EIPClientError, OutcomeUnknownError
 
 FAST = {"max_retries": 0, "retry_backoff_base": 0.0}
 
@@ -107,6 +107,79 @@ async def test_micro800_mismatch_is_refused_without_retrying() -> None:
     assert info.value.meta["attempts"] == 1
     assert controller.opens == 1
     assert controller.all_calls("close")  # the session was not left open
+
+
+class StubbedSocketLogixDriver(LogixDriver):
+    """The real LogixDriver.open()/_initialize_driver(), with only the network I/O stubbed."""
+
+    product_name = "2080-LC50-24QWB"
+
+    def _list_identity(self) -> dict:
+        return {"product_name": self.product_name}
+
+    def get_plc_info(self) -> dict:
+        return {
+            "vendor": "Rockwell Automation/Allen-Bradley",
+            "product_type": "Programmable Logic Controller",
+            "product_code": 1,
+            "revision": {"major": 21, "minor": 11},
+            "status": b"\x00\x00",
+            "serial": "00000001",
+            "product_name": self.product_name,
+        }
+
+    def get_plc_name(self) -> str:
+        self._info["name"] = "Prog"
+        return "Prog"
+
+    def get_tag_list(self, program: str | None = None, cache: bool = True) -> list:
+        return []
+
+    def close(self) -> None:
+        self._connection_opened = False
+
+
+@pytest.mark.parametrize(
+    "product, configured, micro800, cip_path",
+    [
+        ("2080-LC50-24QWB", True, True, []),  # pycomm3 strips backplane/0 for a Micro800
+        ("2080-LC30-48QWB", False, True, []),
+        ("1756-L83E/B", False, False, [("bp", "0")]),
+    ],
+)
+def test_real_initialize_driver_detects_micro800(
+    monkeypatch: pytest.MonkeyPatch, product: str, configured: bool, micro800: bool, cip_path: list
+) -> None:
+    from pycomm3.cip_driver import CIPDriver
+
+    def fake_cip_open(self: CIPDriver) -> bool:  # socket + session registration
+        self._connection_opened = True
+        return True
+
+    monkeypatch.setattr(CIPDriver, "open", fake_cip_open)
+    monkeypatch.setattr(StubbedSocketLogixDriver, "product_name", product)
+    built: list[LogixDriver] = []
+
+    def factory(path: str) -> LogixDriver:
+        built.append(StubbedSocketLogixDriver(path))
+        return built[-1]
+
+    client = EIPClient(EIPClientConfig(host="10.0.0.9", micro800=configured, **FAST), driver_factory=factory)
+    client._connect_once()
+    driver = built[0]
+    assert driver._micro800 is micro800  # set by pycomm3's own _initialize_driver
+    assert [(seg.port, str(seg.link_address)) for seg in driver._cfg["cip_path"]] == cip_path
+    assert client.connection_status()["micro800_detected"] is micro800
+
+
+def test_real_initialize_driver_micro800_mismatch(monkeypatch: pytest.MonkeyPatch) -> None:
+    from pycomm3.cip_driver import CIPDriver
+
+    monkeypatch.setattr(CIPDriver, "open", lambda self: setattr(self, "_connection_opened", True) or True)
+    monkeypatch.setattr(StubbedSocketLogixDriver, "product_name", "1769-L33ER/B")
+    client = EIPClient(EIPClientConfig(micro800=True, **FAST), driver_factory=StubbedSocketLogixDriver)
+    with pytest.raises(EIPClientError, match="1769-L33ER/B'?, not a Micro800"):
+        client._connect_once()
 
 
 def test_micro800_is_detected_even_when_not_configured() -> None:
@@ -229,7 +302,7 @@ async def test_write_multiple_tags_reports_partial_failure() -> None:
 async def test_single_entry_write_multiple_tags() -> None:
     controller = FakeController()
     results, _ = await make_client(controller).write_multiple_tags([("MotorSpeed", 3.0, None)])
-    assert results == [{"tag": "MotorSpeed", "value": 3.0, "data_type": "REAL", "error": None}]
+    assert results == [{"tag": "MotorSpeed", "value": 3.0, "data_type": "REAL", "error": None, "outcome": "written"}]
 
 
 async def test_get_tag_list_does_not_replace_pycomm3s_tag_cache() -> None:
@@ -244,6 +317,7 @@ async def test_get_tag_list_does_not_replace_pycomm3s_tag_cache() -> None:
         "dimensions": [3],
         "alias": False,
         "external_access": "Read/Write",
+        "description": None,  # pycomm3 does not read tag descriptions
     } in tags
     json.dumps(tags)  # pycomm3's type_class objects are gone
     assert controller.all_calls("get_tag_list") == [("get_tag_list", None, False)]
@@ -408,3 +482,82 @@ async def test_real_pycomm3_uses_enip_port_and_timeout(black_hole: BlackHole) ->
     elapsed = time.perf_counter() - start
     assert len(black_hole.accepted) == 3  # ENIP_PORT reached the socket; one connection per attempt
     assert 0.8 < elapsed < 3.0  # 3 x ENIP_TIMEOUT (0.3 s), far below pycomm3's default 5 s each
+
+
+# -- writes are never repeated once they may have reached the controller ------
+
+
+async def test_write_whose_reply_is_lost_is_sent_exactly_once() -> None:
+    controller = FakeController(reply_errors=[CommError("failed to receive reply")])
+    client = make_client(controller, max_retries=3)
+    with pytest.raises(OutcomeUnknownError, match="may have been applied") as info:
+        await client.write_tag("Batch_Count", 7)
+    assert info.value.meta["outcome"] == "unknown" and info.value.meta["attempts"] == 1
+    assert controller.all_calls("write") == [("write", (("Batch_Count", 7),))]  # not re-sent
+    assert controller.tags["Batch_Count"] == (7, "DINT")  # it was in fact applied
+
+
+async def test_write_retries_only_opening_the_session() -> None:
+    controller = FakeController(open_errors=[CommError("refused"), CommError("refused")])
+    result, meta = await make_client(controller, max_retries=3).write_tag("Batch_Count", 8)
+    assert result["value"] == 8 and meta["attempts"] == 3
+    assert controller.opens == 3
+    assert len(controller.all_calls("write")) == 1
+
+
+async def test_write_that_never_got_a_session_is_reported_not_sent() -> None:
+    controller = FakeController(open_errors=[CommError("refused")] * 5)
+    with pytest.raises(EIPClientError) as info:
+        await make_client(controller, max_retries=1).write_tag("Batch_Count", 9)
+    assert not isinstance(info.value, OutcomeUnknownError)
+    assert info.value.meta["outcome"] == "not_sent" and info.value.meta["attempts"] == 2
+    assert controller.all_calls("write") == []
+
+
+async def test_write_on_a_broken_session_is_not_retried() -> None:
+    controller = FakeController(op_errors=[CommError("failed to send message")])
+    client = make_client(controller, max_retries=3)
+    await client.ensure_connection()
+    with pytest.raises(OutcomeUnknownError):
+        await client.write_tag("Batch_Count", 10)
+    assert len(controller.all_calls("write")) == 1
+
+
+async def test_set_plc_time_whose_reply_is_lost_is_sent_exactly_once() -> None:
+    controller = FakeController(reply_errors=[CommError("failed to receive reply")])
+    with pytest.raises(OutcomeUnknownError, match="may have been applied"):
+        await make_client(controller, max_retries=3).set_plc_time()
+    assert len(controller.set_time_calls) == 1
+
+
+async def test_batch_write_whose_reply_is_lost_reports_every_entry_unknown() -> None:
+    controller = FakeController(reply_errors=[CommError("failed to receive reply")])
+    results, meta = await make_client(controller, max_retries=3).write_multiple_tags(
+        [("MotorSpeed", 1.0, None), ("Batch_Count", 5, None)]
+    )
+    assert len(controller.all_calls("write")) == 1
+    assert [r["outcome"] for r in results] == ["unknown", "unknown"]
+    assert all("may have been applied" in r["error"] for r in results)
+    assert meta["outcome"] == "unknown"
+
+
+async def test_batch_write_without_a_session_reports_not_sent() -> None:
+    controller = FakeController(open_errors=[CommError("refused")] * 5)
+    results, _ = await make_client(controller, max_retries=0).write_multiple_tags(
+        [("MotorSpeed", 1.0, None), ("Batch_Count", 5, None)]
+    )
+    assert [r["outcome"] for r in results] == ["not_sent", "not_sent"]
+    assert controller.all_calls("write") == []
+
+
+async def test_reads_are_still_retried_after_a_lost_reply() -> None:
+    controller = FakeController(op_errors=[CommError("failed to receive reply")])
+    result, meta = await make_client(controller, max_retries=1).read_tag("MotorSpeed")
+    assert result["value"] == 1450.0 and meta["attempts"] == 2
+
+
+def test_backoff_is_capped() -> None:
+    client = EIPClient(EIPClientConfig(max_retries=10, retry_backoff_base=60.0))
+    assert client._backoff(1) == MAX_BACKOFF_S == 30.0
+    assert max(client._backoff(n) for n in range(1, 11)) == MAX_BACKOFF_S
+    assert EIPClient(EIPClientConfig(retry_backoff_base=0.5))._backoff(3) == 2.0

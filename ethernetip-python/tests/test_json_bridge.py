@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import socket
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 import pytest
 from conftest import MockPLC
 
-from ethernetip_mcp.eip_client import EIPClient, EIPClientConfig, EIPClientError
+from ethernetip_mcp.eip_client import EIPClient, EIPClientConfig, EIPClientError, OutcomeUnknownError
+from ethernetip_mcp.server import EtherNetIPMCPServer
+from ethernetip_mcp.tools import ToolConfig
 
 pytestmark = pytest.mark.integration
 
@@ -66,6 +71,11 @@ async def test_writes_are_type_checked(mock_plc: MockPLC) -> None:
         await client.write_tag("Line_Speed", "fast")
     with pytest.raises(EIPClientError, match="is REAL, not DINT"):
         await client.write_tag("Line_Speed", 3, "DINT")
+    flag = "Program:MainProgram.Conveyor_Status.Running"
+    assert (await client.write_tag(flag, 0))[0]["value"] is False  # 1/0 accepted, as pycomm3 does
+    assert (await client.write_tag(flag, 1))[0]["value"] is True
+    with pytest.raises(EIPClientError, match="expected true/false or 1/0"):
+        await client.write_tag(flag, 2)
     with pytest.raises(EIPClientError, match="at most 82 characters"):
         await client.write_tag("Program:MainProgram.Alarm_Message", "x" * 83)
     assert (await client.read_tag("Line_Speed"))[0]["value"] == 12.5  # nothing changed
@@ -84,6 +94,17 @@ async def test_list_writes_update_leading_elements(mock_plc: MockPLC) -> None:
 async def test_tag_list_scopes(mock_plc: MockPLC) -> None:
     client = bridge(mock_plc.port)
     controller_tags, meta = await client.get_tag_list()
+    levels = [t for t in (await client.get_tag_list("MainProgram"))[0] if t["tag"].endswith("Tank_Levels")][0]
+    # Same keys and conventions as a real controller's list (see _tag_definition).
+    assert levels == {
+        "tag": "Program:MainProgram.Tank_Levels",
+        "data_type": "REAL",
+        "dimensions": [3],
+        "tag_type": "atomic",
+        "alias": False,
+        "external_access": "Read/Write",
+        "description": None,
+    }
     every, _ = await client.get_tag_list("*")
     program, _ = await client.get_tag_list("MainProgram")
     assert [t["tag"] for t in controller_tags] == ["Line_Speed", "Batch_Count"] and meta["count"] == 2
@@ -160,7 +181,140 @@ def test_mock_rejects_malformed_requests(mock_plc: MockPLC) -> None:
 async def test_write_multiple_tags_reports_each_entry(mock_plc: MockPLC) -> None:
     client = bridge(mock_plc.port)
     results, meta = await client.write_multiple_tags([("Batch_Count", 3, "DINT"), ("Line_Speed", 2, "DINT")])
-    assert results[0] == {"tag": "Batch_Count", "value": 3, "data_type": "DINT", "error": None}
-    assert results[1]["error"] == "Tag 'Line_Speed' is REAL, not DINT"
+    assert results[0] == {"tag": "Batch_Count", "value": 3, "data_type": "DINT", "error": None, "outcome": "written"}
+    assert results[1]["error"] == "Tag 'Line_Speed' is REAL, not DINT" and results[1]["outcome"] == "rejected"
     assert meta["attempts"] == 2
     assert (await client.read_tag("Batch_Count"))[0]["value"] == 3
+
+
+# -- writes are never repeated once they may have reached the device ---------
+
+Handler = Callable[[dict[str, Any], asyncio.StreamWriter], Awaitable[None]]
+
+
+@asynccontextmanager
+async def fake_bridge(handler: Handler, host: str = "127.0.0.1") -> AsyncIterator[tuple[int, list[dict[str, Any]]]]:
+    """A one-request-per-connection JSON bridge whose replies the test controls."""
+    received: list[dict[str, Any]] = []
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        line = await reader.readline()
+        if line:
+            request = json.loads(line)
+            received.append(request)
+            try:
+                await handler(request, writer)
+            except (ConnectionError, OSError):
+                pass
+        writer.close()
+
+    server = await asyncio.start_server(serve, host, 0)
+    try:
+        yield server.sockets[0].getsockname()[1], received
+    finally:
+        server.close()
+        await server.wait_closed()
+
+
+def reply(writer: asyncio.StreamWriter, request: dict[str, Any]) -> None:
+    data = {"tag": request.get("tag"), "value": request.get("value"), "data_type": "DINT"}
+    writer.write(json.dumps({"success": True, "data": data}).encode() + b"\n")
+
+
+async def test_bridge_write_with_late_reply_is_sent_exactly_once() -> None:
+    async def late(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        await asyncio.sleep(0.5)  # applied, but answered after the client's timeout
+        reply(writer, request)
+
+    async with fake_bridge(late) as (port, received):
+        client = bridge(port, timeout=0.2, max_retries=3)
+        with pytest.raises(OutcomeUnknownError, match="may have been applied") as info:
+            await client.write_tag("StartCmd", 1)
+        await asyncio.sleep(0.6)
+    assert len(received) == 1
+    assert info.value.meta["outcome"] == "unknown" and info.value.meta["attempts"] == 1
+
+
+async def test_bridge_set_plc_time_dropped_reply_is_sent_exactly_once() -> None:
+    async def drop(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        return None  # connection closes without a reply
+
+    async with fake_bridge(drop) as (port, received):
+        with pytest.raises(OutcomeUnknownError):
+            await bridge(port, max_retries=3).set_plc_time()
+    assert [r["op"] for r in received] == ["set_time"]
+
+
+async def test_bridge_write_to_unreachable_device_is_retried_and_not_sent(closed_port: int) -> None:
+    with pytest.raises(EIPClientError) as info:
+        await bridge(closed_port, max_retries=2).write_tag("Batch_Count", 1)
+    assert not isinstance(info.value, OutcomeUnknownError)
+    assert info.value.meta == {**info.value.meta, "outcome": "not_sent", "attempts": 3}
+
+
+async def test_bridge_reads_are_still_retried_after_a_dropped_reply() -> None:
+    async def flaky(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        if flaky.calls == 0:
+            flaky.calls += 1
+            return None
+        writer.write(
+            json.dumps({"success": True, "data": {"tag": "X", "value": 3, "data_type": "DINT"}}).encode() + b"\n"
+        )
+
+    flaky.calls = 0
+    async with fake_bridge(flaky) as (port, received):
+        result, meta = await bridge(port, max_retries=1).read_tag("X")
+    assert result["value"] == 3 and meta["attempts"] == 2 and len(received) == 2
+
+
+async def test_batch_reports_applied_entries_when_the_connection_drops() -> None:
+    async def first_only(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        if request["tag"] == "A":
+            reply(writer, request)  # B: applied or not, the connection drops without a reply
+
+    async with fake_bridge(first_only) as (port, received):
+        client = EIPClient(EIPClientConfig(port=port, json_bridge=True, timeout=1, max_retries=2))
+        server = EtherNetIPMCPServer(client=client, tool_config=ToolConfig(writes_enabled=True))
+        from mcp.shared.memory import create_connected_server_and_client_session
+
+        async with create_connected_server_and_client_session(server.mcp) as session:
+            result = await session.call_tool(
+                "write_multiple_tags",
+                {
+                    "payloads": [
+                        {"tag_name": "A", "value": 1},
+                        {"tag_name": "B", "value": 2},
+                        {"tag_name": "C", "value": 3},
+                    ]
+                },
+            )
+    envelope = result.structuredContent
+    assert [r["tag"] for r in received] == ["A", "B"]  # B sent once, C never sent
+    assert envelope["success"] is False
+    assert "2 of 3 writes were not confirmed" in envelope["error"]
+    outcomes = [(r["tag"], r["outcome"]) for r in envelope["data"]["results"]]
+    assert outcomes == [("A", "written"), ("B", "unknown"), ("C", "not_sent")]
+    assert "may have been applied" in envelope["data"]["results"][1]["error"]
+    assert envelope["data"]["results"][2]["error"].startswith("not attempted")
+
+
+def _ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6) as sock:
+            sock.bind(("::1", 0))
+        return True
+    except OSError:
+        return False
+
+
+@pytest.mark.skipif(not _ipv6_loopback(), reason="no IPv6 loopback")
+async def test_bridge_over_ipv6() -> None:
+    async def answer(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        writer.write(
+            json.dumps({"success": True, "data": {"tag": "X", "value": 1, "data_type": "DINT"}}).encode() + b"\n"
+        )
+
+    async with fake_bridge(answer, host="::1") as (port, _):
+        config = EIPClientConfig.from_env({"ENIP_JSON_BRIDGE": "true", "ENIP_HOST": f"[::1]:{port}"})
+        result, _ = await EIPClient(config).read_tag("X")
+    assert result["value"] == 1

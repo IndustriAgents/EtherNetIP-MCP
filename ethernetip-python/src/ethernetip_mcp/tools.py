@@ -195,8 +195,21 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         return None
 
     def system_refused(tool: str) -> dict[str, Any] | None:
-        if not config.system_cmds_enabled:
-            return fail("System commands are disabled (set ENIP_SYSTEM_CMDS_ENABLED=true)", {"tool": tool})
+        # System commands change the controller, so they need both gates.
+        missing = [
+            name
+            for name, enabled in (
+                ("ENIP_WRITES_ENABLED", config.writes_enabled),
+                ("ENIP_SYSTEM_CMDS_ENABLED", config.system_cmds_enabled),
+            )
+            if not enabled
+        ]
+        if missing:
+            return fail(
+                f"{tool} changes the controller and is disabled: it needs ENIP_WRITES_ENABLED=true and "
+                f"ENIP_SYSTEM_CMDS_ENABLED=true (not set: {', '.join(missing)})",
+                {"tool": tool},
+            )
         return None
 
     def alias_spec(alias: str, tool: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -241,6 +254,10 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
     @server.tool()
     async def write_tag(tag_name: TagName, value: Any, data_type: DataType | None = None) -> dict[str, Any]:
         """Write one tag on the controller. Refused unless ENIP_WRITES_ENABLED=true.
+
+        Sent at most once: if the reply is lost, the result is success=false
+        with meta.outcome='unknown' (the write may have been applied; read the
+        tag back before writing again).
 
         `value` is a number, boolean, string, list (written to consecutive array
         elements) or object (structure members). On a real controller pycomm3
@@ -340,9 +357,11 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
     ) -> dict[str, Any]:
         """Write several tags in one call. Refused unless ENIP_WRITES_ENABLED=true.
 
-        data.results has one {tag, value, data_type, error} entry per payload.
-        success is true only if every write succeeded; the writes are not
-        atomic, so on failure check which entries were applied.
+        data.results always has one {tag, value, data_type, error, outcome}
+        entry per payload. outcome is 'written', 'rejected' (the device
+        refused it), 'unknown' (it may have been applied but was not
+        confirmed; read it back) or 'not_sent'. success is true only if every
+        entry was written. The writes are not atomic and are never re-sent.
         """
         refused = writes_refused("write_multiple_tags")
         if refused:
@@ -367,10 +386,12 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         except (EIPClientError, ValueError) as exc:
             return fail(str(exc), _error_meta(exc, tool="write_multiple_tags"))
         meta = {**meta, "count": len(results)}
-        failed = [r for r in results if r["error"]]
+        failed = [r for r in results if r["outcome"] != "written"]
         if failed:
-            detail = "; ".join(f"{r['tag']}: {r['error']}" for r in failed)
-            return fail(f"{len(failed)} of {len(results)} writes failed: {detail}", meta, {"results": results})
+            detail = "; ".join(f"{r['tag']} ({r['outcome']}): {r['error']}" for r in failed)
+            return fail(
+                f"{len(failed)} of {len(results)} writes were not confirmed: {detail}", meta, {"results": results}
+            )
         return ok({"results": results}, meta)
 
     @server.tool()
@@ -482,7 +503,12 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
 
     @server.tool()
     async def set_plc_time() -> dict[str, Any]:
-        """Set the controller's wall clock to this host's current time. Refused unless ENIP_SYSTEM_CMDS_ENABLED=true."""
+        """Set the controller's wall clock to this host's current time.
+
+        Refused unless both ENIP_WRITES_ENABLED=true and ENIP_SYSTEM_CMDS_ENABLED=true.
+        Not retried once sent: if the reply is lost, the error says the clock
+        may have been set.
+        """
         refused = system_refused("set_plc_time")
         if refused:
             return refused

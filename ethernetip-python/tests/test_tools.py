@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -64,12 +65,13 @@ async def session(
     writes: bool = False,
     system: bool = False,
     tag_map: Path | None = None,
+    tool_config: ToolConfig | None = None,
 ) -> AsyncIterator[ClientSession]:
     controller = controller or FakeController()
     client = EIPClient(EIPClientConfig(max_retries=0, retry_backoff_base=0.0), driver_factory=controller.factory)
     server = EtherNetIPMCPServer(
         client=client,
-        tool_config=ToolConfig(writes_enabled=writes, system_cmds_enabled=system, tag_map_path=tag_map),
+        tool_config=tool_config or ToolConfig(writes_enabled=writes, system_cmds_enabled=system, tag_map_path=tag_map),
     )
     async with create_connected_server_and_client_session(server.mcp) as client_session:
         yield client_session
@@ -105,7 +107,7 @@ async def test_server_reports_its_own_version() -> None:
     server = EtherNetIPMCPServer(client=client, tool_config=ToolConfig())
     options = server.mcp._mcp_server.create_initialization_options()
     assert options.server_name == "EtherNet/IP MCP Server"
-    assert options.server_version == package_version() == "0.1.0"
+    assert options.server_version == package_version() == importlib.metadata.version("ethernetip-mcp")
 
 
 @pytest.mark.parametrize(
@@ -120,18 +122,30 @@ async def test_server_reports_its_own_version() -> None:
 )
 async def test_writes_are_refused_by_default(tool: str, arguments: dict[str, Any], tag_map_file: Path) -> None:
     controller = FakeController()
-    async with session(controller, tag_map=tag_map_file) as s:
+    # Only TAG_MAP_FILE is set: the write gate comes from ToolConfig's own default.
+    default_config = ToolConfig.from_env({"TAG_MAP_FILE": str(tag_map_file)})
+    async with session(controller, tool_config=default_config) as s:
         envelope = await call(s, tool, arguments)
     assert envelope["success"] is False
     assert "ENIP_WRITES_ENABLED=true" in envelope["error"]
     assert controller.all_calls("write") == []
 
 
-async def test_set_plc_time_needs_system_commands() -> None:
+@pytest.mark.parametrize(
+    "writes, system, missing",
+    [
+        (False, False, "ENIP_WRITES_ENABLED, ENIP_SYSTEM_CMDS_ENABLED"),
+        (True, False, "ENIP_SYSTEM_CMDS_ENABLED"),
+        (False, True, "ENIP_WRITES_ENABLED"),  # system commands alone are not enough
+    ],
+)
+async def test_set_plc_time_needs_both_gates(writes: bool, system: bool, missing: str) -> None:
     controller = FakeController()
-    async with session(controller, writes=True) as s:
+    async with session(controller, writes=writes, system=system) as s:
         envelope = await call(s, "set_plc_time")
-    assert envelope["success"] is False and "ENIP_SYSTEM_CMDS_ENABLED" in envelope["error"]
+    assert envelope["success"] is False
+    assert "needs ENIP_WRITES_ENABLED=true and ENIP_SYSTEM_CMDS_ENABLED=true" in envelope["error"]
+    assert envelope["error"].endswith(f"(not set: {missing})")
     assert controller.set_time_calls == []
 
 
@@ -241,13 +255,15 @@ async def test_batch_partial_failures_are_failures() -> None:
         )
     assert reads["success"] is False and reads["error"].startswith("1 of 2 reads failed: Nope")
     assert reads["data"]["results"][0]["value"] == 1450.0
-    assert writes["success"] is False and writes["error"].startswith("1 of 2 writes failed: Nope")
+    assert writes["success"] is False
+    assert writes["error"].startswith("1 of 2 writes were not confirmed: Nope (rejected)")
+    assert [r["outcome"] for r in writes["data"]["results"]] == ["written", "rejected"]
     assert writes["data"]["results"][0]["error"] is None
 
 
 async def test_plc_info_time_and_set_time() -> None:
     controller = FakeController()
-    async with session(controller, system=True) as s:
+    async with session(controller, writes=True, system=True) as s:
         info = await call(s, "get_plc_info")
         plc_time = await call(s, "get_plc_time")
         set_time = await call(s, "set_plc_time")
@@ -343,3 +359,14 @@ async def test_no_tag_map_configured() -> None:
         read = await call(s, "read_tag_by_alias", {"alias": "x"})
     assert listing["success"] is True and listing["data"] == {"aliases": [], "count": 0}
     assert read["success"] is False and "none defined" in read["error"]
+
+
+async def test_lost_write_reply_is_reported_as_unknown_outcome() -> None:
+    from pycomm3 import CommError
+
+    controller = FakeController(reply_errors=[CommError("failed to receive reply")])
+    async with session(controller, writes=True) as s:
+        envelope = await call(s, "write_tag", {"tag_name": "Batch_Count", "value": 3})
+    assert envelope["success"] is False and "may have been applied" in envelope["error"]
+    assert envelope["meta"]["outcome"] == "unknown"
+    assert len(controller.all_calls("write")) == 1

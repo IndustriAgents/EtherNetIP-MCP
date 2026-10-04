@@ -59,6 +59,8 @@ class FakeController:
     open_result: bool = True
     open_errors: list[BaseException] = field(default_factory=list)
     op_errors: list[BaseException] = field(default_factory=list)
+    # Raised after a write/set_plc_time was applied: the reply was lost.
+    reply_errors: list[BaseException] = field(default_factory=list)
     drivers: list[FakeLogixDriver] = field(default_factory=list)
     set_time_calls: list[int | None] = field(default_factory=list)
 
@@ -93,6 +95,10 @@ class FakeLogixDriver(LogixDriver):
     def _maybe_fail(self) -> None:
         if self.controller.op_errors:
             raise self.controller.op_errors.pop(0)
+
+    def _maybe_lose_reply(self) -> None:
+        if self.controller.reply_errors:
+            raise self.controller.reply_errors.pop(0)
 
     def _lookup(self, request: str) -> tuple[str, int | None, Any, str]:
         match = _COUNT.match(request)
@@ -174,6 +180,7 @@ class FakeLogixDriver(LogixDriver):
                 continue
             self.controller.tags[base] = (value, data_type)
             results.append(Tag(base, value, data_type, None))
+        self._maybe_lose_reply()
         return results if len(tags_values) > 1 else results[0]
 
     def get_tag_list(self, *args: Any, **kwargs: Any) -> list[dict[str, Any]]:
@@ -243,6 +250,7 @@ class FakeLogixDriver(LogixDriver):
         self.calls.append(("set_plc_time", bound.arguments["microseconds"]))
         self._maybe_fail()
         self.controller.set_time_calls.append(bound.arguments["microseconds"])
+        self._maybe_lose_reply()
         return Tag("set_plc_time", None, None, None)
 
 

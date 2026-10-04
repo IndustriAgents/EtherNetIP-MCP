@@ -63,6 +63,33 @@ def test_invalid_configuration_is_rejected(env: dict[str, str], message: str) ->
             EIPClientConfig.from_env(env)
 
 
+@pytest.mark.parametrize(
+    "host, expected",
+    [
+        ("::1", ("::1", 44818)),
+        ("[::1]", ("::1", 44818)),
+        ("[::1]:5025", ("::1", 5025)),
+        ("fe80::1", ("fe80::1", 44818)),
+        ("localhost:5025", ("localhost", 5025)),
+    ],
+)
+def test_json_bridge_accepts_ipv6(host: str, expected: tuple[str, int]) -> None:
+    config = EIPClientConfig.from_env({"ENIP_JSON_BRIDGE": "true", "ENIP_HOST": host})
+    assert (config.host, config.port) == expected
+
+
+@pytest.mark.parametrize("host", ["::1", "[::1]:44818", "[fe80::1]"])
+def test_cip_rejects_ipv6_clearly(host: str) -> None:
+    with pytest.raises(ConfigError, match="IPv6 address; pycomm3 connects to controllers over IPv4 only"):
+        EIPClientConfig.from_env({"ENIP_HOST": host})
+
+
+@pytest.mark.parametrize("host", ["[::1", "[]:5025", "[::1]5025", "[::1]:x"])
+def test_malformed_bracketed_hosts(host: str) -> None:
+    with pytest.raises(ConfigError, match="ENIP_HOST"):
+        EIPClientConfig.from_env({"ENIP_JSON_BRIDGE": "true", "ENIP_HOST": host})
+
+
 def test_json_bridge_accepts_port_65535() -> None:
     assert EIPClientConfig.from_env({"ENIP_JSON_BRIDGE": "true", "ENIP_PORT": "65535"}).port == 65535
 

@@ -36,6 +36,7 @@ _TRUE = {"1", "true", "yes", "y", "on"}
 _FALSE = {"0", "false", "no", "n", "off"}
 _COUNT_SUFFIX = re.compile(r"^(?P<base>.+)\{(?P<count>\d+)\}$")
 _MAX_REPLY_BYTES = 16 * 1024 * 1024
+MAX_BACKOFF_S = 30.0
 
 OperationMeta = dict[str, Any]
 
@@ -50,6 +51,14 @@ class EIPClientError(RuntimeError):
     def __init__(self, message: str, meta: OperationMeta | None = None) -> None:
         super().__init__(message)
         self.meta: OperationMeta = dict(meta or {})
+
+
+class OutcomeUnknownError(EIPClientError):
+    """A write-like request may have reached the device, but it was not confirmed.
+
+    Such requests are never repeated automatically: the caller must read the
+    value back before deciding to write again.
+    """
 
 
 class _TransientError(EIPClientError):
@@ -108,18 +117,30 @@ def _parse_float(env: Mapping[str, str], name: str, default: float, low: float, 
 
 
 def _split_host_port(text: str, name: str) -> tuple[str, int | None]:
-    """Split ``host`` or ``host:port`` (the forms pycomm3 accepts)."""
-    host, sep, port_text = text.partition(":")
-    host = host.strip()
-    if not host:
-        raise ConfigError(f"{name}={text!r} has no host")
-    if not sep:
-        return host, None
+    """Split ``host``, ``host:port``, a bare IPv6 address or ``[ipv6]:port``."""
+    text = text.strip()
+    if text.startswith("["):
+        host, closed, rest = text[1:].partition("]")
+        if not closed or not host.strip():
+            raise ConfigError(f"{name}={text!r} is not a valid [IPv6]:port address")
+        if not rest:
+            return host.strip(), None
+        if not rest.startswith(":"):
+            raise ConfigError(f"{name}={text!r} is not a valid [IPv6]:port address")
+        port_text = rest[1:]
+    elif text.count(":") > 1:
+        return text, None  # a bare IPv6 address, no port
+    else:
+        host, sep, port_text = text.partition(":")
+        if not host.strip():
+            raise ConfigError(f"{name}={text!r} has no host")
+        if not sep:
+            return host.strip(), None
     try:
         port = int(port_text)
     except ValueError:
         raise ConfigError(f"{name}={text!r} has an invalid port") from None
-    return host, port
+    return host.strip(), port
 
 
 @dataclass(slots=True)
@@ -140,6 +161,11 @@ class EIPClientConfig:
     def __post_init__(self) -> None:
         if not self.host:
             raise ConfigError("ENIP_HOST is empty")
+        if ":" in self.host and not self.json_bridge:
+            # pycomm3's Socket is AF_INET only and its path parser splits on ':'.
+            raise ConfigError(
+                f"ENIP_HOST={self.host!r} is an IPv6 address; pycomm3 connects to controllers over IPv4 only"
+            )
         # pycomm3's parse_connection_path() rejects port 65535, so the CIP
         # backend stops one short of the TCP maximum.
         max_port = 65535 if self.json_bridge else 65534
@@ -343,18 +369,26 @@ def plc_time_payload(microseconds: int) -> dict[str, Any]:
     return {"plc_time": when.isoformat(), "microseconds": microseconds}
 
 
+TAG_LIST_KEYS = ("tag", "data_type", "dimensions", "tag_type", "alias", "external_access", "description")
+
+
 def _tag_definition(raw: Mapping[str, Any]) -> dict[str, Any]:
-    """Reduce a pycomm3 tag definition to JSON (drops its ``type_class`` objects)."""
+    """Reduce a pycomm3 tag definition to the shared tag-list entry.
+
+    Drops pycomm3's ``type_class`` objects. pycomm3 does not read tag
+    descriptions, so ``description`` is always None on the CIP backend.
+    """
     dims = int(raw.get("dim") or 0)
     dimensions = [d for d in (raw.get("dimensions") or [])[:dims]]
     return _jsonable(
         {
             "tag": raw.get("tag_name"),
             "data_type": raw.get("data_type_name"),
-            "tag_type": raw.get("tag_type"),
             "dimensions": dimensions,
+            "tag_type": raw.get("tag_type"),
             "alias": raw.get("alias"),
             "external_access": raw.get("external_access"),
+            "description": None,
         }
     )
 
@@ -499,9 +533,7 @@ class EIPClient:
             response, meta = await self._json_exchange(label, payload)
             data = self._json_data(response, label, meta, expect=list)
             tags = [
-                {"tag": item.get("tag"), "data_type": item.get("data_type"), "description": item.get("description")}
-                for item in data
-                if isinstance(item, Mapping)
+                _jsonable({key: item.get(key) for key in TAG_LIST_KEYS}) for item in data if isinstance(item, Mapping)
             ]
         else:
             # cache=False: with the default cache=True pycomm3 replaces its own
@@ -571,14 +603,14 @@ class EIPClient:
             payload: dict[str, Any] = {"op": "write", "tag": base, "value": value}
             if data_type:
                 payload["data_type"] = data_type
-            response, meta = await self._json_exchange(label, payload)
+            response, meta = await self._json_exchange(label, payload, repeatable=False)
             data = self._json_data(response, label, meta)
             return {"tag": base, "value": data.get("value", value), "data_type": data.get("data_type")}, meta
 
         # LogixDriver.write(*tags_values) takes (tag, value) tuples and has no
         # data type argument: pycomm3 encodes with the controller's own tag
         # definition. A list is written as Tag{N} so every element is sent.
-        tag_result, meta = await self._run_cip(label, lambda driver: driver.write((request, value)))
+        tag_result, meta = await self._run_cip(label, lambda driver: driver.write((request, value)), repeatable=False)
         if tag_result.error:
             raise EIPClientError(f"{label} failed: {tag_result.error}", meta)
         actual = tag_result.type
@@ -590,36 +622,33 @@ class EIPClient:
     async def write_multiple_tags(
         self, items: list[tuple[str, Any, str | None]]
     ) -> tuple[list[dict[str, Any]], OperationMeta]:
-        """Write ``(tag, value, data_type)`` entries; ``data_type`` may be None."""
+        """Write ``(tag, value, data_type)`` entries; ``data_type`` may be None.
+
+        Always returns one result per entry, each with an ``outcome``:
+        ``written``, ``rejected`` (the device refused it), ``unknown`` (it may
+        have been applied but was not confirmed) or ``not_sent``. Nothing is
+        retried once it may have reached the device. Raises only ValueError,
+        for bad input, before anything is sent.
+        """
         if not items:
             raise ValueError("payloads must contain at least one entry")
         prepared = [(*self._write_request(tag, value), value, data_type) for tag, value, data_type in items]
         if self.config.json_bridge:
-            results = []
-            attempts = 0
-            for base, _, value, data_type in prepared:
-                payload: dict[str, Any] = {"op": "write", "tag": base, "value": value}
-                if data_type:
-                    payload["data_type"] = data_type
-                response, meta = await self._json_exchange(f"write_tag({base})", payload)
-                attempts += meta.get("attempts", 1)
-                if response.get("success"):
-                    data = response.get("data") or {}
-                    results.append(
-                        {
-                            "tag": base,
-                            "value": data.get("value", value),
-                            "data_type": data.get("data_type"),
-                            "error": None,
-                        }
-                    )
-                else:
-                    error = str(response.get("error") or "write failed")
-                    results.append({"tag": base, "value": value, "data_type": None, "error": error})
-            return results, {"backend": self.backend, "attempts": attempts}
+            return await self._json_write_multiple(prepared)
 
         pairs = [(request, value) for _, request, value, _ in prepared]
-        raw, meta = await self._run_cip("write_multiple_tags", lambda driver: driver.write(*pairs))
+        try:
+            raw, meta = await self._run_cip(
+                "write_multiple_tags", lambda driver: driver.write(*pairs), repeatable=False
+            )
+        except EIPClientError as exc:
+            # One request carried every entry, so they share the outcome.
+            outcome = exc.meta.get("outcome", "unknown")
+            results = [
+                {"tag": base, "value": _jsonable(value), "data_type": None, "error": str(exc), "outcome": outcome}
+                for base, _, value, _ in prepared
+            ]
+            return results, exc.meta
         results = []
         for (base, _, value, data_type), tag_result in zip(prepared, _as_tag_list(raw), strict=True):
             error = str(tag_result.error) if tag_result.error else None
@@ -628,6 +657,7 @@ class EIPClient:
                 "value": _jsonable(value),
                 "data_type": None if error else tag_result.type,
                 "error": error,
+                "outcome": "rejected" if error else "written",
             }
             warning = None if error else _type_warning(data_type, tag_result.type)
             if warning:
@@ -635,15 +665,57 @@ class EIPClient:
             results.append(result)
         return results, meta
 
+    async def _json_write_multiple(
+        self, prepared: list[tuple[str, str, Any, str | None]]
+    ) -> tuple[list[dict[str, Any]], OperationMeta]:
+        results: list[dict[str, Any]] = []
+        attempts = 0
+        stopped: str | None = None
+        for base, _, value, data_type in prepared:
+            if stopped is not None:
+                results.append(
+                    {"tag": base, "value": value, "data_type": None, "error": stopped, "outcome": "not_sent"}
+                )
+                continue
+            payload: dict[str, Any] = {"op": "write", "tag": base, "value": value}
+            if data_type:
+                payload["data_type"] = data_type
+            try:
+                response, meta = await self._json_exchange(f"write_tag({base})", payload, repeatable=False)
+            except EIPClientError as exc:
+                attempts += exc.meta.get("attempts", 1)
+                outcome = exc.meta.get("outcome", "unknown")
+                results.append({"tag": base, "value": value, "data_type": None, "error": str(exc), "outcome": outcome})
+                stopped = f"not attempted: the batch stopped after the connection failed on {base}"
+                continue
+            attempts += meta.get("attempts", 1)
+            if response.get("success"):
+                data = response.get("data") or {}
+                results.append(
+                    {
+                        "tag": base,
+                        "value": data.get("value", value),
+                        "data_type": data.get("data_type"),
+                        "error": None,
+                        "outcome": "written",
+                    }
+                )
+            else:
+                error = str(response.get("error") or "write failed")
+                results.append({"tag": base, "value": value, "data_type": None, "error": error, "outcome": "rejected"})
+        return results, {"backend": self.backend, "attempts": attempts}
+
     async def set_plc_time(self) -> tuple[dict[str, Any], OperationMeta]:
         """Set the controller clock to this host's current time."""
         microseconds = int(time.time() * 1_000_000)
         if self.config.json_bridge:
-            response, meta = await self._json_exchange("set_plc_time", {"op": "set_time", "microseconds": microseconds})
+            response, meta = await self._json_exchange(
+                "set_plc_time", {"op": "set_time", "microseconds": microseconds}, repeatable=False
+            )
             data = self._json_data(response, "set_plc_time", meta)
             return plc_time_payload(int(data.get("microseconds", microseconds))), meta
         tag_result, meta = await self._run_cip(
-            "set_plc_time", lambda driver: driver.set_plc_time(microseconds=microseconds)
+            "set_plc_time", lambda driver: driver.set_plc_time(microseconds=microseconds), repeatable=False
         )
         if tag_result.error:
             raise EIPClientError(f"set_plc_time failed: {tag_result.error}", meta)
@@ -685,7 +757,12 @@ class EIPClient:
     # -- CIP internals --------------------------------------------------------
 
     def _backoff(self, attempt: int) -> float:
-        return self.config.retry_backoff_base * (2 ** (attempt - 1))
+        return min(self.config.retry_backoff_base * (2 ** (attempt - 1)), MAX_BACKOFF_S)
+
+    @property
+    def _address(self) -> str:
+        host = self.config.host
+        return f"[{host}]:{self.config.port}" if ":" in host else f"{host}:{self.config.port}"
 
     def _open_locked(self) -> Any:
         """Return a connected driver, opening one (single attempt) if needed.
@@ -739,14 +816,25 @@ class EIPClient:
         with self._lock:
             self._drop_driver_locked()
 
-    def _execute_sync(self, label: str, operation: Callable[[Any], Any]) -> tuple[Any, OperationMeta]:
+    def _execute_sync(
+        self, label: str, operation: Callable[[Any], Any], repeatable: bool = True
+    ) -> tuple[Any, OperationMeta]:
+        """Run ``operation`` on a connected driver.
+
+        Opening the session is retried on connection-level failures. The
+        operation itself is retried only if ``repeatable``: a write (or
+        set_plc_time) that fails after it may have reached the controller,
+        for example because its reply was lost, is never sent again.
+        """
         start = time.perf_counter()
         attempts = 0
         while True:
             attempts += 1
+            phase = "open"
             try:
                 with self._lock:
                     driver = self._open_locked()
+                    phase = "operation"
                     result = operation(driver)
                     self._last_contact = time.time()
                     self._last_error = None
@@ -759,16 +847,26 @@ class EIPClient:
                         # The session is broken: pycomm3's open() would return
                         # early on it, so build a fresh driver next time.
                         self._drop_driver_locked()
+                meta: OperationMeta = {
+                    "backend": "cip",
+                    "attempts": attempts,
+                    "duration_ms": round((time.perf_counter() - start) * 1000.0, 3),
+                }
+                if phase == "operation" and not repeatable:
+                    meta["outcome"] = "unknown"
+                    raise OutcomeUnknownError(
+                        f"{label}: the request may have reached the controller, but it failed before a reply "
+                        f"confirmed it ({message}). It may have been applied; read the value back before "
+                        "trying again.",
+                        meta,
+                    ) from exc
                 if transient and attempts <= self.config.max_retries:
                     delay = self._backoff(attempts)
                     logger.info("%s: %s; retrying in %.2f s", label, message, delay)
                     time.sleep(delay)
                     continue
-                meta = {
-                    "backend": "cip",
-                    "attempts": attempts,
-                    "duration_ms": round((time.perf_counter() - start) * 1000.0, 3),
-                }
+                if not repeatable:
+                    meta["outcome"] = "not_sent"
                 if transient:
                     raise EIPClientError(f"{label} failed after {attempts} attempt(s): {message}", meta) from exc
                 raise EIPClientError(f"{label} failed: {message}", meta) from exc
@@ -779,13 +877,16 @@ class EIPClient:
             }
             return result, meta
 
-    async def _run_cip(self, label: str, operation: Callable[[Any], Any]) -> tuple[Any, OperationMeta]:
-        return await anyio.to_thread.run_sync(self._execute_sync, label, operation)
+    async def _run_cip(
+        self, label: str, operation: Callable[[Any], Any], repeatable: bool = True
+    ) -> tuple[Any, OperationMeta]:
+        return await anyio.to_thread.run_sync(self._execute_sync, label, operation, repeatable)
 
     # -- JSON bridge internals -----------------------------------------------
 
-    async def _json_request(self, payload: dict[str, Any]) -> dict[str, Any]:
-        address = f"{self.config.host}:{self.config.port}"
+    async def _json_request(self, payload: dict[str, Any], progress: dict[str, bool]) -> dict[str, Any]:
+        """One request/reply. Sets ``progress["sent"]`` once bytes may have left."""
+        address = self._address
         try:
             stream = await anyio.connect_tcp(self.config.host, self.config.port)
         except Exception as exc:
@@ -793,6 +894,7 @@ class EIPClient:
         raw = b""
         async with stream:
             try:
+                progress["sent"] = True
                 await stream.send(json.dumps(payload).encode("utf-8") + b"\n")
                 while b"\n" not in raw:
                     try:
@@ -817,19 +919,27 @@ class EIPClient:
             raise EIPClientError(f"JSON bridge at {address} sent a reply that is not an object")
         return response
 
-    async def _json_exchange(self, label: str, payload: dict[str, Any]) -> tuple[dict[str, Any], OperationMeta]:
-        """Send one request, retrying connection-level failures only."""
+    async def _json_exchange(
+        self, label: str, payload: dict[str, Any], repeatable: bool = True
+    ) -> tuple[dict[str, Any], OperationMeta]:
+        """Send one request.
+
+        Failing to connect is retried. Once the request may have been sent it
+        is repeated only if ``repeatable``; a write whose reply is lost is
+        reported as possibly applied instead (``OutcomeUnknownError``).
+        """
         start = time.perf_counter()
         attempts = 0
         while True:
             attempts += 1
+            progress = {"sent": False}
             try:
                 with anyio.fail_after(self.config.timeout):
-                    response = await self._json_request(payload)
+                    response = await self._json_request(payload, progress)
             except TimeoutError as exc:
                 failure: EIPClientError = _TransientError(f"no reply within {self.config.timeout} s")
                 failure.__cause__ = exc
-            except _TransientError as exc:
+            except EIPClientError as exc:
                 failure = exc
             else:
                 self._connected = True
@@ -843,15 +953,27 @@ class EIPClient:
                 return response, meta
             self._connected = False
             self._last_error = f"{label}: {failure}"
-            if attempts <= self.config.max_retries:
-                await anyio.sleep(self._backoff(attempts))
-                continue
             meta = {
                 "backend": "json_bridge",
                 "attempts": attempts,
                 "duration_ms": round((time.perf_counter() - start) * 1000.0, 3),
             }
-            raise EIPClientError(f"{label} failed after {attempts} attempt(s): {failure}", meta) from failure
+            if progress["sent"] and not repeatable:
+                meta["outcome"] = "unknown"
+                raise OutcomeUnknownError(
+                    f"{label}: the request was sent, but no valid reply confirmed it ({failure}). "
+                    "It may have been applied; read the value back before trying again.",
+                    meta,
+                ) from failure
+            transient = isinstance(failure, _TransientError)
+            if transient and attempts <= self.config.max_retries:
+                await anyio.sleep(self._backoff(attempts))
+                continue
+            if not repeatable:
+                meta["outcome"] = "not_sent"
+            if transient:
+                raise EIPClientError(f"{label} failed after {attempts} attempt(s): {failure}", meta) from failure
+            raise EIPClientError(f"{label} failed: {failure}", meta) from failure
 
     @staticmethod
     def _json_data(response: dict[str, Any], label: str, meta: OperationMeta, expect: type = dict) -> Any:
@@ -868,6 +990,7 @@ __all__ = [
     "EIPClient",
     "EIPClientConfig",
     "EIPClientError",
+    "OutcomeUnknownError",
     "parse_bool",
     "plc_time_payload",
     "split_element_count",

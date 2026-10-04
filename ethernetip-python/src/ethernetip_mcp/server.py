@@ -94,7 +94,8 @@ class EtherNetIPMCPServer:
             instructions=(
                 "Reads and writes tags on Rockwell/Allen-Bradley Logix controllers over EtherNet/IP. "
                 "Every tool returns {success, data, error, meta}. Write tools are refused unless the "
-                "operator set ENIP_WRITES_ENABLED=true; set_plc_time needs ENIP_SYSTEM_CMDS_ENABLED=true."
+                "operator set ENIP_WRITES_ENABLED=true; set_plc_time also needs ENIP_SYSTEM_CMDS_ENABLED=true. "
+                "A write is never re-sent: if meta.outcome is 'unknown', read the tag back before writing again."
             ),
             dependencies=["pycomm3"],
             lifespan=self._lifespan,
