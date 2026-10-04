@@ -68,3 +68,74 @@ def test_removed_settings_are_named() -> None:
     for name in ("ENIP_INIT_INFO", "ENIP_CACHE_TAG_LIST", "ENIP_CACHE_TIMEOUT"):
         assert name in section
         assert name not in settings_read_by_the_server()
+
+
+# -- the .env rule is documented where people look (suite rule 3) -------------
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["README.md", "SECURITY.md", "ethernetip-python/README.md", "ethernetip-python/.env.example"],
+)
+def test_env_file_rule_is_documented(path: str) -> None:
+    text = (REPO_ROOT / path).read_text(encoding="utf-8")
+    assert "--env-file" in text
+    assert "ENIP_WRITES_ENABLED" in text and "ENIP_SYSTEM_CMDS_ENABLED" in text
+
+
+def test_env_example_lists_every_setting() -> None:
+    example = (REPO_ROOT / "ethernetip-python" / ".env.example").read_text(encoding="utf-8")
+    for name in settings_read_by_the_server():
+        assert re.search(rf"^#? ?{name}=", example, flags=re.M), name
+
+
+# -- documented response keys match real envelopes ---------------------------
+
+DOCUMENTED_KEYS = {
+    "read_tag": "{tag, value, data_type}",
+    "write_tag": "{tag, value, data_type}",
+    "write_multiple_tags": "{tag, value, data_type, error, outcome, request_sent}",
+    "get_tag_list": "{tag, data_type, dimensions, tag_type, alias, external_access, description}",
+    "get_plc_info": "{name, vendor, product_type, product_code, product_name, revision, firmware, serial, keyswitch}",
+    "get_plc_time": "{plc_time, microseconds}",
+    "set_plc_time": "{updated, plc_time, microseconds}",
+    "ping": "{reachable, latency_ms, product_name, connection, writes_enabled, system_cmds_enabled, tag_aliases}",
+}
+CALLS = {
+    "read_tag": {"tag_name": "MotorSpeed"},
+    "write_tag": {"tag_name": "MotorSpeed", "value": 2.0},
+    "write_multiple_tags": {"payloads": [{"tag_name": "MotorSpeed", "value": 2.0}]},
+    "get_tag_list": {},
+    "get_plc_info": {},
+    "get_plc_time": {},
+    "set_plc_time": {},
+    "ping": {},
+}
+
+
+def _keys(text: str) -> set[str]:
+    return {part.strip() for part in text.strip("{}").split(",")}
+
+
+@pytest.mark.parametrize("tool", sorted(DOCUMENTED_KEYS))
+async def test_documented_keys_match_the_envelope(tool: str) -> None:
+    from fake_pycomm3 import FakeController
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from ethernetip_mcp.eip_client import EIPClient, EIPClientConfig
+    from ethernetip_mcp.server import EtherNetIPMCPServer
+    from ethernetip_mcp.tools import ToolConfig
+
+    assert DOCUMENTED_KEYS[tool] in README, f"README does not show {DOCUMENTED_KEYS[tool]} for {tool}"
+    controller = FakeController()
+    client = EIPClient(EIPClientConfig(max_retries=0), driver_factory=controller.factory)
+    server = EtherNetIPMCPServer(client=client, tool_config=ToolConfig(writes_enabled=True, system_cmds_enabled=True))
+    async with create_connected_server_and_client_session(server.mcp) as session:
+        envelope = (await session.call_tool(tool, CALLS[tool])).structuredContent
+    assert envelope["success"] is True, envelope["error"]
+    data = envelope["data"]
+    if tool == "write_multiple_tags":
+        data = data["results"][0]
+    elif tool == "get_tag_list":
+        data = data["tags"][0]
+    assert set(data) == _keys(DOCUMENTED_KEYS[tool])

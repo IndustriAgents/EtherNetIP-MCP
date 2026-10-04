@@ -49,8 +49,12 @@ change that breaks one of these needs a reason in the pull request:
    go through the same guard, and the defaults stay off.
 3. **A write is sent at most once.** Only opening the connection may be
    retried. Pass `repeatable=False` to `_run_cip`/`_json_exchange` for any
-   operation that changes the device, and report a lost reply as
-   `outcome: "unknown"`, never as success and never by re-sending.
+   operation that changes the device, report a lost reply as
+   `outcome: "unknown"`, never as success and never by re-sending, and give
+   every write result `outcome` and `request_sent`.
+   Safety switches (`*_WRITES_ENABLED`, `*_SYSTEM_CMDS_ENABLED`) are never
+   taken from an automatically found `.env`; only the process environment
+   or `--env-file` can turn them on.
 4. **The mock can answer it.** If you add a tool, the mock has to be able to
    answer it, or nobody can test it without a plant.
 5. **Tool names line up with the rest of the suite.** Keep tool and argument
@@ -103,6 +107,7 @@ uv run --locked ruff check src tests
 uv run --locked ruff format --check src tests
 uv run --locked python -m compileall -q src
 uv run --locked python -c "import ethernetip_mcp; from ethernetip_mcp.cli import main"
+uv run --locked ethernetip-mcp --help
 ENIP_REQUIRE_INTEGRATION=1 uv run --locked pytest -v
 
 cd ../ethernetip-mock-server
@@ -116,6 +121,14 @@ uv run --locked ethernetip-mock-server --help
 
 CI also builds the server in-process and checks that every tool registers with
 a description; the exact snippet is in the workflow.
+
+A third CI job checks the declared dependency floors: it installs both
+projects with every direct dependency at its lowest allowed version and runs
+the same lint and tests. To reproduce it, use a scratch copy of the
+repository (it rewrites `uv.lock`) and run, in each project,
+`UV_RESOLUTION=lowest-direct uv sync --extra dev`, then the same `ruff` and
+`pytest` commands with `UV_RESOLUTION=lowest-direct` set and without
+`--locked`. If you raise a dependency's floor, make sure that job still passes.
 
 The test suite in `ethernetip-python/tests` has three layers:
 
@@ -134,7 +147,8 @@ The test suite in `ethernetip-python/tests` has three layers:
 - **A docs test** that fails if the README's configuration table misses a
   setting the code reads, or its "Behaviour changes" list misses a tool.
 
-Add a test with every fix or tool change. Then, if you like, drive the server
+Add a test with every fix or tool change. A test for a safety rule must be
+able to fail: check it by removing the protection and watching it fail. Then, if you like, drive the server
 the way a user would, through the Inspector or a real MCP client, against the
 mock. Check the envelope, not just the value.
 

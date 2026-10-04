@@ -79,7 +79,9 @@ For a real controller, drop `ENIP_JSON_BRIDGE` and `ENIP_PORT`, and set `ENIP_HO
 
 ## Configuration
 
-Set these in the client config's `env`, in the environment, or in a `.env` file in `ethernetip-python/` (git-ignored). The server reads them when it starts, after loading `.env`; variables already set in the environment win over `.env`. An invalid value (a port that is not a number, `ENIP_WRITES_ENABLED=ture`, conflicting settings) stops the server at startup with a `configuration error` message on stderr and exit code 2. An empty value counts as unset.
+Set these in the client config's `env` or the process environment. The server reads them when it starts; an invalid value (a port that is not a number, `ENIP_WRITES_ENABLED=ture`, conflicting settings) stops the server at startup with a `configuration error` message on stderr and exit code 2. An empty value counts as unset.
+
+**`.env` files cannot turn on writes.** Connection settings may also come from a `.env` file: the server uses the first one it finds walking up from its package directory (for a source checkout, `ethernetip-python/.env`, then the repository root). Such an automatically found file may **not** enable a safety switch: `ENIP_WRITES_ENABLED` and `ENIP_SYSTEM_CMDS_ENABLED` in it are ignored, with a warning on stderr naming the variable. The search can reach files nobody wrote for this server, such as a project's `.env` in a parent directory. Set the switches in the client config's `env`, or put them in a file you name explicitly: `ethernetip-mcp --env-file /path/to/eip.env` honours every setting in that file. Variables already set in the environment always win over either file. [`ethernetip-python/.env.example`](ethernetip-python/.env.example) lists the settings.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -92,8 +94,8 @@ Set these in the client config's `env`, in the environment, or in a `.env` file 
 | `ENIP_JSON_BRIDGE` | `false` | Talk to the mock's JSON-over-TCP protocol instead of CIP. |
 | `ENIP_MAX_RETRIES` | `3` | Retries (0–10) for connection-level failures: a call makes at most this + 1 attempts. Reads may be re-sent. A write or `set_plc_time` is retried only while the connection is being opened, never once its request may have been sent (see [Writes are sent at most once](#writes-are-sent-at-most-once)). Errors the device reports (unknown tag, wrong type) are not retried. |
 | `ENIP_RETRY_BACKOFF_BASE` | `0.5` | Base delay of the retry backoff, in seconds (0–60): retry *n* waits this × 2<sup>n−1</sup>, capped at 30 s per wait. |
-| `ENIP_WRITES_ENABLED` | `false` | Allows the write tools, and is one of the two settings `set_plc_time` needs. Off by default: a model will call a tool it has been given. |
-| `ENIP_SYSTEM_CMDS_ENABLED` | `false` | Allows system commands. `set_plc_time` changes the controller, so it needs both this and `ENIP_WRITES_ENABLED=true`. |
+| `ENIP_WRITES_ENABLED` | `false` | Allows the write tools, and is one of the two settings `set_plc_time` needs. Off by default: a model will call a tool it has been given. Ignored in an automatically found `.env`. |
+| `ENIP_SYSTEM_CMDS_ENABLED` | `false` | Allows system commands. `set_plc_time` changes the controller, so it needs both this and `ENIP_WRITES_ENABLED=true`. Ignored in an automatically found `.env`. |
 | `ENIP_WRITE_PROBE_IDLE` | `10` | Seconds. Before a write or `set_plc_time` on a CIP session idle at least this long, read the controller's identity first (a liveness probe that is safe to repeat); if that fails, reconnect, then send the write once. `0` probes before every write. |
 | `ENIP_DEBUG` | `false` | Debug logging, including `pycomm3`'s, on stderr. |
 | `TAG_MAP_FILE` | unset | JSON file of tag aliases with optional scaling, used by `list_tags` and the `*_by_alias` tools. |
@@ -130,14 +132,19 @@ Some details:
 - A read returns `data: {tag, value, data_type}`. Array elements follow `pycomm3`: `read_array` (or `read_tag` with `count`, or the `Tag{N}` syntax) returns a list of N elements; reading an array tag without a count returns one element.
 - A write returns `data: {tag, value, data_type}`, where `data_type` is the type the device used. A list written with `write_tag` or `write_array` goes to consecutive elements (`Tag{N}`). Pass an object to write a structure.
 - `read_multiple_tags` returns one `{tag, value, data_type, error}` entry per tag; if any read failed, `success` is `false` and `data.results` shows which.
-- `write_multiple_tags` always returns `data.results`, one `{tag, value, data_type, error, outcome}` entry per payload. `outcome` is `written`, `rejected` (the device refused it), `unknown` (it may have been applied; read it back) or `not_sent`. `success` is `true` only if every entry was written. Batch writes are not atomic; on the JSON bridge the batch stops at the first connection failure and marks the rest `not_sent`.
+- `write_multiple_tags` always returns `data.results`, one `{tag, value, data_type, error, outcome, request_sent}` entry per payload. `outcome` is `written`, `rejected` (the device refused it), `unknown` (it may have been applied; read it back) or `not_sent`. `success` is `true` only if every entry was written. Batch writes are not atomic; on the JSON bridge the batch stops at the first connection failure and marks the rest `not_sent`.
 - `get_tag_list` returns `{tag, data_type, dimensions, tag_type, alias, external_access, description}` per tag on both backends. `data_type` is the element type and `dimensions` the array size (`[]` for a scalar). `description` is always `null` on a real controller, because `pycomm3` does not read tag descriptions.
-- Bad arguments (a missing tag name, `elements: 0`, an empty list, a duplicate tag in a batch) come back as `success: false` with `Invalid arguments for <tool>: ...`, not as a protocol error.
+- Bad arguments (a missing tag name, `elements: 0`, an empty list, a duplicate tag in a batch) come back as `success: false` with `Invalid arguments for <tool>: ...`, not as a protocol error. Counts are strict integers: `true`, `"2"` and `2.0` are refused.
+- A boolean is never written into a numeric tag (`SINT` … `ULINT`, `REAL`, `LREAL`): `pycomm3` would silently write 1 or 0, so the server refuses it before sending. Booleans are fine for `BOOL` tags and bits (`Word.3`).
 - `get_plc_time` returns `data: {plc_time, microseconds}`; `set_plc_time` sets the controller clock to this host's current time and needs both `ENIP_WRITES_ENABLED=true` and `ENIP_SYSTEM_CMDS_ENABLED=true`.
 
 ### Writes are sent at most once
 
-A write (`write_tag`, `write_array`, `write_string`, `write_tag_by_alias`, `write_multiple_tags`) or `set_plc_time` is never sent twice by the server. If opening the connection fails, nothing was sent and that part is retried. If the connection fails after the request may have gone out, for example because the reply was lost or timed out, the tool answers `success: false` with `meta.outcome: "unknown"` (per entry in a batch) and an error saying the write may have been applied. Read the tag back before writing again: re-sending could re-trigger a command or handshake bit. If nothing was sent, the error carries `meta.outcome: "not_sent"`.
+A write (`write_tag`, `write_array`, `write_string`, `write_tag_by_alias`, `write_multiple_tags`) or `set_plc_time` is never sent twice by the server. If opening the connection fails, nothing was sent and that part is retried. If the connection fails after the request may have gone out, for example because the reply was lost or timed out, the tool answers `success: false` with `meta.outcome: "unknown"` (per entry in a batch) and an error saying the write may have been applied. Read the tag back before writing again: re-sending could re-trigger a command or handshake bit.
+
+Every write result says what happened: `meta.outcome` (per entry in a batch) is `written`, `rejected` (the device refused it), `unknown` (it may have been applied) or `not_sent`, and `meta.request_sent` is `true` for the first three and `false` for `not_sent`. On a real controller, a write `pycomm3` refuses locally (an unknown tag, a value it cannot encode for the tag's type, a boolean for a numeric tag) is `not_sent`; a large write that `pycomm3` split into fragments and that failed part-way is `unknown`. `pycomm3` reports these cases as error text, so the classification follows `pycomm3` 1.2.14's messages.
+
+On the CIP path, a session that has been idle for `ENIP_WRITE_PROBE_IDLE` seconds (default 10) is checked before a write with a cheap identity read. If the controller dropped it, the server reconnects first, so the write goes out once on a working session instead of failing as `unknown`.
 
 ## Known limitations
 
@@ -145,7 +152,7 @@ A write (`write_tag`, `write_array`, `write_string`, `write_tag_by_alias`, `writ
 - **`data_type` is not enforced on the CIP path.** `pycomm3` always encodes a write with the controller's own type for the tag; it has no data type argument. If the `data_type` you pass (or the tag map's) differs, the write still uses the controller's type and the response carries a `meta.warning` (or a per-entry `warning` in batches). The mock refuses a mismatched `data_type`.
 - **`ENIP_TIMEOUT` depends on a `pycomm3` internal.** `pycomm3` 1.2.14 has no setting for its socket timeout (its `socket_timeout` setter writes a misspelled key), so the server sets `_cfg["socket_timeout"]` before connecting. The dependency is pinned to `pycomm3>=1.2.14,<1.3`; a test fails if that changes.
 - **A failing call can take a while.** With the defaults, an unreachable controller that drops packets costs up to 4 attempts × `ENIP_TIMEOUT` (5 s) plus 3.5 s of backoff, about 24 s, before the tool answers; a refused connection fails within the 3.5 s of backoff. Each backoff wait is capped at 30 s. Lower `ENIP_MAX_RETRIES` (for example `0` against the mock) for faster answers.
-- **A write on a dropped session is not retried.** If the controller closed an idle session, the next write fails with `outcome: "unknown"` even though it probably never arrived, because the server cannot tell that apart from a lost reply. Read the tag and call the tool again.
+- **A session can still die between the probe and the write.** The liveness probe catches a session dropped while idle, but if the connection breaks between the probe (or a recent call) and the write, the write fails with `outcome: "unknown"` even if it never arrived, because the server cannot tell that apart from a lost reply. Read the tag and call the tool again. The probe itself (a connected Get_Attribute_Single of the identity object) has not been run against a physical controller yet.
 - **The mock is not a controller.** It speaks JSON over TCP, not CIP, and has no structures (UDTs), no array element indexing (`Tag[1]`), and a single program. See [its README](ethernetip-mock-server/README.md).
 - **mcp 1.x only.** The server uses `mcp.server.fastmcp`, which mcp 2.x renamed, so `mcp` is pinned to `<2`.
 
@@ -153,7 +160,8 @@ A write (`write_tag`, `write_array`, `write_string`, `write_tag_by_alias`, `writ
 
 If you used an earlier commit, these changed (the old shapes were not kept):
 
-- **Gates:** writes are off by default (`ENIP_WRITES_ENABLED=false`), and `set_plc_time` needs both `ENIP_WRITES_ENABLED=true` and `ENIP_SYSTEM_CMDS_ENABLED=true`.
+- **Gates:** writes are off by default (`ENIP_WRITES_ENABLED=false`), and `set_plc_time` needs both `ENIP_WRITES_ENABLED=true` and `ENIP_SYSTEM_CMDS_ENABLED=true`. An automatically found `.env` can no longer turn either on; use the client's `env` or `--env-file`.
+- **Write results:** single writes and `set_plc_time` always carry `meta.outcome` and `meta.request_sent`; batch entries carry `outcome` and `request_sent`. Booleans are no longer accepted as counts or written into numeric tags.
 - **Retries:** writes and `set_plc_time` are never re-sent once the request may have reached the device; a lost reply gives `success: false` with `meta.outcome: "unknown"`.
 - **Settings:** `ENIP_TIMEOUT` defaults to 5 s and now takes effect, as do `ENIP_PORT` and `ENIP_MICRO800` on the CIP path. `ENIP_INIT_INFO`, `ENIP_CACHE_TAG_LIST` and `ENIP_CACHE_TIMEOUT`, which never did anything, are no longer read. Invalid settings stop the server at startup (exit code 2). The server no longer exits when the controller is unreachable at startup.
 - **`read_tag` / `read_array`:** `data: {tag, value, data_type}` (plus `elements` with a count) instead of `data: {tag, result: {tag, value, data_type, status, error}}`.

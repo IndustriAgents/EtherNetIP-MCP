@@ -26,7 +26,9 @@ uv sync
 ENIP_HOST=127.0.0.1 ENIP_PORT=5025 ENIP_JSON_BRIDGE=true uv run ethernetip-mcp
 ```
 
-The server speaks MCP over stdio, so it waits for a client on stdin; its logs go to stderr. Create a `.env` file in this directory or set environment variables to configure host, slot or route, timeouts, retries, write permissions and the tag map path. The full list is in the [Configuration](../README.md#configuration) section of the top-level README. Write tools are refused unless `ENIP_WRITES_ENABLED=true`.
+The server speaks MCP over stdio, so it waits for a client on stdin; its logs go to stderr. Configure it with environment variables; the full list is in the [Configuration](../README.md#configuration) section of the top-level README, and [`.env.example`](.env.example) shows them all.
+
+A `.env` file in this directory (or a parent) is read automatically, but only for connection settings: `ENIP_WRITES_ENABLED` and `ENIP_SYSTEM_CMDS_ENABLED` in an automatically found `.env` are ignored, with a warning on stderr. Set those in the MCP client's `env`, or pass a file explicitly with `uv run ethernetip-mcp --env-file /path/to/eip.env`, which honours every setting in it. Write tools are refused unless `ENIP_WRITES_ENABLED=true`.
 
 ## Layout
 
@@ -36,6 +38,7 @@ ethernetip-python/
 ├── pyproject.toml
 ├── uv.lock
 ├── .python-version
+├── .env.example        # every setting; copy for --env-file
 ├── src/ethernetip_mcp
 │   ├── __init__.py
 │   ├── cli.py          # entry point: load .env, build the server, run stdio
@@ -45,7 +48,8 @@ ethernetip-python/
 └── tests
     ├── fake_pycomm3.py         # LogixDriver stand-in that enforces pycomm3's real signatures
     ├── test_config.py
-    ├── test_docs.py            # README covers every setting and breaking change
+    ├── test_docs.py            # README covers every setting, breaking change and response shape
+    ├── test_env.py             # an automatic .env cannot enable writes; --env-file can
     ├── test_pycomm3_path.py    # pycomm3 call shapes, retries, writes sent once, port/timeout/Micro800
     ├── test_tools.py           # tools over an in-memory MCP session
     ├── test_json_bridge.py     # client against the mock PLC (subprocess)
