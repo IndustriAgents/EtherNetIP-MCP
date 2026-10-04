@@ -80,10 +80,13 @@ class MockPLC:
         self.process: subprocess.Popen[bytes] | None = None
 
     def start(self) -> MockPLC:
+        # The lowest-direct CI job sets UV_RESOLUTION; the committed lock is
+        # for the default resolution, so --locked would refuse it there.
+        locked = [] if os.environ.get("UV_RESOLUTION") else ["--locked"]
         command = [
             _uv(),
             "run",
-            "--locked",
+            *locked,
             "--directory",
             str(MOCK_DIR),
             "ethernetip-mock-server",

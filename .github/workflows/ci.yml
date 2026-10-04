@@ -50,6 +50,9 @@ jobs:
       - name: Import package and entry point
         run: uv run --locked python -c "import ethernetip_mcp; from ethernetip_mcp.cli import main"
 
+      - name: Entry point help
+        run: uv run --locked ethernetip-mcp --help
+
       # Building the server does not connect: the PLC session is opened in the
       # MCP lifespan, so this checks tool registration without a device.
       - name: Register MCP tools
@@ -104,3 +107,50 @@ jobs:
 
       - name: Entry point help
         run: uv run --locked ethernetip-mock-server --help
+
+  # The declared floors must work: resolve every direct dependency of both
+  # projects to its lowest allowed version and run the same checks. UV_RESOLUTION
+  # also reaches the `uv run` the integration tests use to start the mock.
+  # (No --locked here: the committed locks are for the default resolution.)
+  lowest-direct:
+    name: Lowest direct dependencies
+    runs-on: ubuntu-latest
+    env:
+      UV_RESOLUTION: lowest-direct
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install the server (lowest direct versions, dev extra)
+        working-directory: ethernetip-python
+        run: uv sync --extra dev
+
+      - name: Install the mock PLC (lowest direct versions, dev extra)
+        working-directory: ethernetip-mock-server
+        run: uv sync --extra dev
+
+      - name: Show the resolved floors
+        working-directory: ethernetip-python
+        run: uv pip list | grep -iE '^(mcp|anyio|pydantic|pycomm3|python-dotenv|pytest|pytest-asyncio|ruff) '
+
+      - name: Lint the server
+        working-directory: ethernetip-python
+        run: |
+          uv run ruff check src tests
+          uv run ruff format --check src tests
+
+      - name: Test the server
+        working-directory: ethernetip-python
+        env:
+          ENIP_REQUIRE_INTEGRATION: "1"
+        run: uv run pytest -v
+
+      - name: Lint and run the mock PLC
+        working-directory: ethernetip-mock-server
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run ethernetip-mock-server --help
