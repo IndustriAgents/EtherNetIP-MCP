@@ -1,15 +1,139 @@
-"""FastMCP wiring for EtherNet/IP tools."""
+"""FastMCP wiring for the EtherNet/IP tools."""
 
 from __future__ import annotations
 
+import logging
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
+import anyio
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.stdio import stdio_server
+from pydantic import ValidationError
 
-from .eip_client import EIPClient
-from .tools import TagMap, ToolConfig, ToolResources, register_tools
+from .eip_client import CALL_CANCELLED, EIPClient, _never
+from .tools import NOT_SENT, WRITE_TOOLS, TagMap, ToolConfig, ToolResources, fail, register_tools
+
+logger = logging.getLogger(__name__)
+
+
+def package_version() -> str:
+    try:
+        return version("ethernetip-mcp")
+    except PackageNotFoundError:  # pragma: no cover - running from a bare source tree
+        return "0.0.0+unknown"
+
+
+def _describe_validation_error(exc: ValidationError) -> str:
+    problems = []
+    for error in exc.errors():
+        location = ".".join(str(part) for part in error.get("loc", ())) or "arguments"
+        problems.append(f"{location}: {error.get('msg', 'invalid value')}")
+    return "; ".join(problems)
+
+
+def request_cancel_scope(lowlevel: Any) -> anyio.CancelScope | None:
+    """The anyio cancel scope of the MCP request being handled, if it can be found.
+
+    mcp 1.x keeps it on the request's RequestResponder, in the session's
+    ``_in_flight`` map; RequestResponder.cancel() sets ``cancel_called`` on it
+    synchronously when the client sends notifications/cancelled. These are
+    private APIs (mcp is pinned to <2); a test fails if they move.
+    """
+    try:
+        context = lowlevel.request_context
+    except LookupError:
+        return None
+    in_flight = getattr(context.session, "_in_flight", None)
+    responder = in_flight.get(context.request_id) if isinstance(in_flight, dict) else None
+    scope = getattr(responder, "_cancel_scope", None)
+    return scope if isinstance(scope, anyio.CancelScope) else None
+
+
+def _log_cancelled_call(name: str, result: Any) -> None:
+    """Record on stderr the outcome a cancelled call's client will never see."""
+    structured = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+    outcomes: list[str] = []
+    if isinstance(structured, dict):
+        meta = structured.get("meta") or {}
+        if meta.get("outcome"):
+            outcomes.append(meta["outcome"])
+        data = structured.get("data") or {}
+        if isinstance(data, dict):
+            outcomes += [
+                r.get("outcome") for r in data.get("results") or [] if isinstance(r, dict) and r.get("outcome")
+            ]
+    if name not in WRITE_TOOLS:
+        logger.info("%s was cancelled by the client; its answer was dropped", name)
+    elif not outcomes or all(outcome == "not_sent" for outcome in outcomes):
+        logger.warning("%s was cancelled by the client; nothing was sent", name)
+    else:
+        logger.warning(
+            "%s was cancelled by the client after its request may have reached the device (outcome %s); "
+            "the client was told it was cancelled",
+            name,
+            ", ".join(outcomes),
+        )
+
+
+class EnvelopeFastMCP(FastMCP):
+    """FastMCP that answers bad arguments and unexpected errors with the envelope.
+
+    Stock FastMCP turns a pydantic validation error into a bare ``isError``
+    text result. Clients of the IndustriConnect servers expect
+    ``{success: false, error}`` instead, so arguments are validated here first.
+    Relies on mcp 1.x internals (``_tool_manager``, ``fn_metadata``); the
+    dependency is pinned to ``mcp<2``.
+    """
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[Any] | dict[str, Any]:
+        scope = request_cancel_scope(self._mcp_server)
+        if scope is None:
+            logger.warning("Cannot see the MCP request's cancel scope; cancellation is only noticed at the next await")
+            token = CALL_CANCELLED.set(_never)
+        else:
+            token = CALL_CANCELLED.set(lambda: scope.cancel_called)
+        try:
+            result = await self._call_tool(name, arguments)
+        finally:
+            CALL_CANCELLED.reset(token)
+        if scope is not None and scope.cancel_called:
+            # The client cancelled this call and the SDK has already answered
+            # "Request cancelled"; a second answer would trip the SDK's
+            # "already responded" assertion. Log what really happened, then end
+            # the call as a cancellation, which the SDK suppresses.
+            _log_cancelled_call(name, result)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            raise anyio.get_cancelled_exc_class()
+        return result
+
+    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[Any] | dict[str, Any]:
+        tool = self._tool_manager.get_tool(name)
+        if tool is None:
+            return await super().call_tool(name, arguments)
+        metadata = tool.fn_metadata
+        try:
+            metadata.arg_model.model_validate(metadata.pre_parse_json(arguments or {}))
+        except ValidationError as exc:
+            message = f"Invalid arguments for {name}: {_describe_validation_error(exc)}"
+            meta = {"tool": name, **(NOT_SENT if name in WRITE_TOOLS else {})}
+            return metadata.convert_result(fail(message, meta))
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            logger.exception("Tool %s raised an unexpected error", name)
+            cause = exc.__cause__ or exc
+            message = f"Internal error in {name}: {type(cause).__name__}: {cause}"
+            meta: dict[str, Any] = {"tool": name}
+            if name in WRITE_TOOLS:
+                # The failure may have come after the request went out.
+                message += ". The write may have been applied; read the value back before trying again."
+                meta.update({"outcome": "unknown", "request_sent": True})
+            return metadata.convert_result(fail(message, meta))
 
 
 @dataclass(slots=True)
@@ -18,7 +142,12 @@ class AppContext:
 
 
 class EtherNetIPMCPServer:
-    """Container responsible for lifecycle + tool registration."""
+    """Builds the client and tool gates from the environment and registers the tools.
+
+    Construct it after ``load_dotenv()`` (``cli.main`` does), since it reads
+    the configuration here, not at import time. Nothing is sent to the device
+    until the MCP lifespan starts.
+    """
 
     def __init__(
         self,
@@ -32,15 +161,62 @@ class EtherNetIPMCPServer:
             config=self.tool_config,
             tag_map=TagMap(self.tool_config.tag_map_path),
         )
-        self._server = FastMCP(
+        debug = self.client.config.debug
+        self._server = EnvelopeFastMCP(
             name="EtherNet/IP MCP Server",
+            instructions=(
+                "Reads and writes tags on Rockwell/Allen-Bradley Logix controllers over EtherNet/IP. "
+                "Every tool returns {success, data, error, meta}. Write tools are refused unless the "
+                "operator set ENIP_WRITES_ENABLED=true; set_plc_time also needs ENIP_SYSTEM_CMDS_ENABLED=true. "
+                "A write is never re-sent: if meta.outcome is 'unknown', read the tag back before writing again."
+            ),
             dependencies=["pycomm3"],
             lifespan=self._lifespan,
+            log_level="DEBUG" if debug else "INFO",
         )
+        # FastMCP reports the mcp SDK's version as serverInfo.version by default.
+        self._server._mcp_server.version = package_version()
+        # Logging goes to stderr (FastMCP installs a stderr handler); stdout is
+        # the MCP channel. pycomm3 logs every request at INFO, so keep it quiet
+        # unless ENIP_DEBUG is on.
+        logging.getLogger("pycomm3").setLevel(logging.DEBUG if debug else logging.WARNING)
+        logging.getLogger("ethernetip_mcp").setLevel(logging.DEBUG if debug else logging.INFO)
         register_tools(self._server, self.resources)
 
+    @property
+    def mcp(self) -> FastMCP:
+        return self._server
+
     def run(self) -> None:
-        self._server.run()
+        anyio.run(self.run_stdio)
+
+    async def run_stdio(self) -> None:
+        """Serve MCP over stdio, and stop pending device requests when the client leaves.
+
+        On end of input the SDK would let in-flight tool calls run to the end,
+        so a write still queued, connecting or waiting to retry would reach
+        the device after the client is gone. Messages are relayed through a
+        stream; at end of input the client is shut down (nothing more may be
+        sent) and every in-flight call is cancelled.
+        """
+        lowlevel = self._server._mcp_server
+        async with stdio_server() as (read_stream, write_stream):
+            relay_send, relay_receive = anyio.create_memory_object_stream[Any](0)
+            async with anyio.create_task_group() as tg:
+
+                async def relay() -> None:
+                    try:
+                        async for message in read_stream:
+                            await relay_send.send(message)
+                    finally:
+                        logger.info("MCP client disconnected; stopping pending device requests")
+                        self.client.shutdown()
+                        tg.cancel_scope.cancel()
+                        relay_send.close()
+
+                tg.start_soon(relay)
+                await lowlevel.run(relay_receive, write_stream, lowlevel.create_initialization_options())
+                tg.cancel_scope.cancel()
 
     @asynccontextmanager
     async def _lifespan(self, server: FastMCP) -> AsyncIterator[AppContext]:  # noqa: ARG002 - signature contract
@@ -48,4 +224,5 @@ class EtherNetIPMCPServer:
         try:
             yield AppContext(client=self.client)
         finally:
-            await self.client.close()
+            with anyio.CancelScope(shield=True):  # also when the server is being cancelled
+                await self.client.close()

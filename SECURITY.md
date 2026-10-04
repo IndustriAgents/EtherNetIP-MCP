@@ -24,14 +24,37 @@ application on the office network.
   [`ethernetip-mock-server`](ethernetip-mock-server/) precisely so that an agent
   can be exercised end to end without touching a real controller. Do that
   first, every time.
-- **Turn writes off until you mean otherwise.** Write tools change tag values
+- **Keep writes off until you mean otherwise.** Write tools change tag values
   on a running controller, which can move physical equipment. There is no undo,
-  and a language model will call a tool it has been given. **Writes are enabled
-  by default in this server** (`ENIP_WRITES_ENABLED` defaults to `true`), unlike
-  the read-only default the IndustriConnect suite aims for. Set
-  `ENIP_WRITES_ENABLED=false` for a read-only server.
-- **Leave system commands off.** `set_plc_time` is refused unless
+  and a language model will call a tool it has been given. Like the rest of the
+  IndustriConnect suite, this server is **read-only by default**: the write
+  tools are refused unless `ENIP_WRITES_ENABLED=true`. Turn it on only for a
+  session that needs it, against a controller where that is safe.
+- **Leave system commands off.** `set_plc_time` changes the controller, so it
+  is refused unless both `ENIP_WRITES_ENABLED=true` and
   `ENIP_SYSTEM_CMDS_ENABLED=true`. Keep it that way unless you need it.
+- **Safety switches never come from an implicit `.env`.** Without
+  `--env-file`, the server loads only `ethernetip-python/.env` of a source
+  checkout, found from the package's own location: never the working
+  directory (usually the MCP client's project) or any parent directory, and
+  nothing at all for an installed package. That file may set only `ENIP_*`
+  and `TAG_MAP_FILE` settings; `ENIP_WRITES_ENABLED`,
+  `ENIP_SYSTEM_CMDS_ENABLED` and anything else in it (`PATH`, `PYTHONPATH`,
+  `LD_PRELOAD`, …) are ignored with a warning on stderr, whatever their
+  letter case. Enable writes in the MCP client's `env`, or in a file you pass
+  explicitly with `--env-file`.
+- **Every device exchange has a deadline.** `ENIP_DEADLINE` bounds each tool
+  call from its start, batches included; nothing is sent once it has passed.
+  A write that runs out of time after it may have been sent is reported
+  `unknown`, never retried.
+- **A cancelled write stays cancelled.** If the MCP client cancels a call or
+  disconnects before a write was sent (queued, connecting or waiting to
+  retry), the write is never sent afterwards; on disconnect the server stops
+  all pending device requests and exits.
+- **A write is sent at most once.** If its reply is lost, the server reports
+  that the write may have been applied (`meta.outcome: "unknown"`,
+  `meta.request_sent: true`) instead of sending it again; read the tag back
+  before repeating it.
 - **Do not expose the server beyond the host running the client.** It is a
   stdio process meant to run beside the MCP client, not a network service.
 - **Keep the mock on loopback.** The mock's JSON bridge has no authentication
@@ -52,8 +75,8 @@ them up through its `EtherNetIP-Project` submodule.
 ## Reporting a vulnerability
 
 Please report privately, through
-[GitHub private vulnerability reporting](https://github.com/IndustriAgents/EtherNetIP-MCP/security/advisories/new),
-or by email to hi@industriagents.com.
+[GitHub private vulnerability reporting](https://github.com/IndustriAgents/EtherNetIP-MCP/security/advisories/new).
+If you cannot use GitHub, email hi@industriagents.com instead.
 
 Please do not open a public issue for a vulnerability.
 

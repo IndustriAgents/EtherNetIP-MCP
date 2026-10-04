@@ -8,15 +8,8 @@ __pycache__/
 .ruff_cache/
 .coverage*
 .hypothesis/
-
-# Node / TypeScript
-node_modules/
 build/
 dist/
-coverage/
-npm-debug.log*
-yarn-error.log*
-.turbo/
 
 # OS & IDE
 .DS_Store
