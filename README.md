@@ -158,7 +158,7 @@ Every write result says what happened: `meta.outcome` (per entry in a batch) is 
 
 `pycomm3` reports these cases as error text, so the classification follows `pycomm3` 1.2.14's messages (the dependency is pinned below 1.3). On the JSON bridge, the mock checks a request completely before applying it, so its refusals are `rejected`.
 
-A write that has not been sent yet is also never sent after the MCP client gives up on it. This covers a write that is queued behind another call, still connecting, or waiting to retry, when the client cancels the call (`notifications/cancelled`) or disconnects (closes stdin). When the client disconnects, the server cancels every pending call, sends nothing more to the device, and exits. A write already on its way is not recalled; the client is gone, so its outcome is only in the server's log.
+A write that has not been sent yet is also never sent after the MCP client gives up on it. This covers a write that is queued behind another call, still connecting, or waiting to retry, when the client cancels the call (`notifications/cancelled`) or disconnects (closes stdin). When the client disconnects, the server cancels every pending call, sends nothing more to the device, and exits. The last check before every send also reads the MCP request's own cancel flag, so a cancel that arrives in the very moment a connection or the session becomes free still stops the write. A write already on its way is not recalled. The client has been told the call was cancelled, so the server logs on stderr what happened instead: "nothing was sent", or the outcome if the request had already gone out.
 
 On the CIP path, a session that has been idle for `ENIP_WRITE_PROBE_IDLE` seconds (default 10) is checked before a write with a cheap identity read. If the controller dropped it, the server reconnects first, so the write goes out once on a working session instead of failing as `unknown`.
 
@@ -170,7 +170,7 @@ On the CIP path, a session that has been idle for `ENIP_WRITE_PROBE_IDLE` second
 - **A failing call can take a while.** With the defaults, an unreachable controller that drops packets costs up to 4 attempts × `ENIP_TIMEOUT` (5 s) plus 3.5 s of backoff, about 24 s, before the tool answers; a refused connection fails within the 3.5 s of backoff. Each backoff wait is capped at 30 s. Lower `ENIP_MAX_RETRIES` (for example `0` against the mock) for faster answers.
 - **A session can still die between the probe and the write.** The liveness probe catches a session dropped while idle, but if the connection breaks between the probe (or a recent call) and the write, the write fails with `outcome: "unknown"` even if it never arrived, because the server cannot tell that apart from a lost reply. Read the tag and call the tool again. The probe itself (a connected Get_Attribute_Single of the identity object) has not been run against a physical controller yet.
 - **The mock is not a controller.** It speaks JSON over TCP, not CIP, and has no structures (UDTs), no array element indexing (`Tag[1]`), and a single program. See [its README](ethernetip-mock-server/README.md).
-- **mcp 1.x only.** The server uses `mcp.server.fastmcp`, which mcp 2.x renamed, so `mcp` is pinned to `<2`.
+- **mcp 1.x only.** The server uses `mcp.server.fastmcp`, which mcp 2.x renamed, so `mcp` is pinned to `<2`. It also reads the request's cancel scope from mcp 1.x internals (`session._in_flight[...]._cancel_scope`); a test fails if they move.
 
 ### Behaviour changes in this version
 

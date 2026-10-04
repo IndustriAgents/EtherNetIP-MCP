@@ -14,6 +14,7 @@ The MCP tools turn both into ``success: false`` envelopes.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime as dt
 import json
 import logging
@@ -92,6 +93,21 @@ _STOP_DETAIL = {
 }
 
 
+def _never() -> bool:
+    return False
+
+
+# Set by the MCP server for the duration of each tool call: returns True once
+# the client has cancelled that call. The SDK flags the request's cancel scope
+# synchronously, but a task whose wait (lock, connect, thread result) has just
+# completed runs one more step before it sees the cancellation, so the
+# pre-send checks read the flag directly. It is a plain bool, safe to read
+# from a worker thread.
+CALL_CANCELLED: contextvars.ContextVar[Callable[[], bool]] = contextvars.ContextVar(
+    "ethernetip_call_cancelled", default=_never
+)
+
+
 class _CallState:
     """Shared by a tool call and its worker thread, to agree on what happened.
 
@@ -100,16 +116,22 @@ class _CallState:
     knows the request may have been sent) or never sends it at all.
     """
 
-    def __init__(self, closing: Callable[[], bool] = lambda: False, not_after: float | None = None) -> None:
+    def __init__(
+        self,
+        closing: Callable[[], bool] = _never,
+        not_after: float | None = None,
+        request_cancelled: Callable[[], bool] = _never,
+    ) -> None:
         self._guard = threading.Lock()
         self._closing = closing
+        self._request_cancelled = request_cancelled
         self.not_after = not_after  # time.monotonic() after which nothing may be sent
         self.phase = "open"
         self.cancelled = False
         self.holding_session = False
 
     def _stop_reason(self) -> str | None:
-        if self.cancelled:
+        if self.cancelled or self._request_cancelled():
             return "cancelled"
         if self._closing():
             return "closing"
@@ -1356,7 +1378,7 @@ class EIPClient:
         it was still connecting. The socket is closed to stop the worker.
         """
         deadline = self.config.deadline_s()
-        state = _CallState(lambda: self._closing, time.monotonic() + deadline)
+        state = _CallState(lambda: self._closing, time.monotonic() + deadline, CALL_CANCELLED.get())
         start = time.perf_counter()
         try:
             with anyio.fail_after(deadline):
@@ -1364,9 +1386,10 @@ class EIPClient:
                     self._execute_sync, label, operation, repeatable, state, abandon_on_cancel=True
                 )
         except _CallStopped as exc:
-            # The worker refused to start or to send: the deadline passed or the client is gone.
+            # The worker refused to start or to send: deadline passed, call cancelled or client gone.
             meta: OperationMeta = {"backend": "cip", "duration_ms": round((time.perf_counter() - start) * 1000.0, 3)}
             detail = _STOP_DETAIL.get(exc.reason, exc.reason)
+            logger.warning("%s: %s; nothing was sent", label, detail)
             raise EIPClientError(
                 f"{label} stopped: {detail}", meta if repeatable else with_outcome(meta, "not_sent")
             ) from exc
@@ -1439,6 +1462,8 @@ class EIPClient:
         return response
 
     def _refuse_if_stopped(self, not_after: float | None) -> None:
+        if CALL_CANCELLED.get()():
+            raise _CallStopped("cancelled")
         if self._closing:
             raise _CallStopped("closing")
         if not_after is not None and time.monotonic() >= not_after:
@@ -1475,6 +1500,7 @@ class EIPClient:
             except _CallStopped as stopped:
                 meta = {"backend": "json_bridge", "attempts": attempts}
                 detail = _STOP_DETAIL.get(stopped.reason, stopped.reason)
+                logger.warning("%s: %s; nothing was sent", label, detail)
                 raise EIPClientError(
                     f"{label} stopped: {detail}", meta if repeatable else with_outcome(meta, "not_sent")
                 ) from None

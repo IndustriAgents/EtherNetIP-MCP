@@ -15,7 +15,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
 from pydantic import ValidationError
 
-from .eip_client import EIPClient
+from .eip_client import CALL_CANCELLED, EIPClient, _never
 from .tools import NOT_SENT, WRITE_TOOLS, TagMap, ToolConfig, ToolResources, fail, register_tools
 
 logger = logging.getLogger(__name__)
@@ -36,6 +36,50 @@ def _describe_validation_error(exc: ValidationError) -> str:
     return "; ".join(problems)
 
 
+def request_cancel_scope(lowlevel: Any) -> anyio.CancelScope | None:
+    """The anyio cancel scope of the MCP request being handled, if it can be found.
+
+    mcp 1.x keeps it on the request's RequestResponder, in the session's
+    ``_in_flight`` map; RequestResponder.cancel() sets ``cancel_called`` on it
+    synchronously when the client sends notifications/cancelled. These are
+    private APIs (mcp is pinned to <2); a test fails if they move.
+    """
+    try:
+        context = lowlevel.request_context
+    except LookupError:
+        return None
+    in_flight = getattr(context.session, "_in_flight", None)
+    responder = in_flight.get(context.request_id) if isinstance(in_flight, dict) else None
+    scope = getattr(responder, "_cancel_scope", None)
+    return scope if isinstance(scope, anyio.CancelScope) else None
+
+
+def _log_cancelled_call(name: str, result: Any) -> None:
+    """Record on stderr the outcome a cancelled call's client will never see."""
+    structured = result[1] if isinstance(result, tuple) and len(result) == 2 else None
+    outcomes: list[str] = []
+    if isinstance(structured, dict):
+        meta = structured.get("meta") or {}
+        if meta.get("outcome"):
+            outcomes.append(meta["outcome"])
+        data = structured.get("data") or {}
+        if isinstance(data, dict):
+            outcomes += [
+                r.get("outcome") for r in data.get("results") or [] if isinstance(r, dict) and r.get("outcome")
+            ]
+    if name not in WRITE_TOOLS:
+        logger.info("%s was cancelled by the client; its answer was dropped", name)
+    elif not outcomes or all(outcome == "not_sent" for outcome in outcomes):
+        logger.warning("%s was cancelled by the client; nothing was sent", name)
+    else:
+        logger.warning(
+            "%s was cancelled by the client after its request may have reached the device (outcome %s); "
+            "the client was told it was cancelled",
+            name,
+            ", ".join(outcomes),
+        )
+
+
 class EnvelopeFastMCP(FastMCP):
     """FastMCP that answers bad arguments and unexpected errors with the envelope.
 
@@ -47,6 +91,27 @@ class EnvelopeFastMCP(FastMCP):
     """
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[Any] | dict[str, Any]:
+        scope = request_cancel_scope(self._mcp_server)
+        if scope is None:
+            logger.warning("Cannot see the MCP request's cancel scope; cancellation is only noticed at the next await")
+            token = CALL_CANCELLED.set(_never)
+        else:
+            token = CALL_CANCELLED.set(lambda: scope.cancel_called)
+        try:
+            result = await self._call_tool(name, arguments)
+        finally:
+            CALL_CANCELLED.reset(token)
+        if scope is not None and scope.cancel_called:
+            # The client cancelled this call and the SDK has already answered
+            # "Request cancelled"; a second answer would trip the SDK's
+            # "already responded" assertion. Log what really happened, then end
+            # the call as a cancellation, which the SDK suppresses.
+            _log_cancelled_call(name, result)
+            await anyio.lowlevel.checkpoint_if_cancelled()
+            raise anyio.get_cancelled_exc_class()
+        return result
+
+    async def _call_tool(self, name: str, arguments: dict[str, Any]) -> Sequence[Any] | dict[str, Any]:
         tool = self._tool_manager.get_tool(name)
         if tool is None:
             return await super().call_tool(name, arguments)

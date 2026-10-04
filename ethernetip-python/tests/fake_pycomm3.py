@@ -21,6 +21,7 @@ import inspect
 import re
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -77,6 +78,9 @@ class FakeController:
     # If set, open()/read() wait for the event first (a slow controller).
     open_gate: threading.Event | None = None
     read_gate: threading.Event | None = None
+    # Called in the worker thread right after open() succeeds / a read completes.
+    after_open: Callable[[], None] | None = None
+    after_read: Callable[[], None] | None = None
     drivers: list[FakeLogixDriver] = field(default_factory=list)
     set_time_calls: list[int | None] = field(default_factory=list)
 
@@ -175,6 +179,8 @@ class FakeLogixDriver(LogixDriver):
         self._connection_opened = True
         self._info = {**self._identity(), "name": self.controller.program_name}
         self._micro800 = self.controller.product_name.startswith("2080")
+        if self.controller.after_open is not None:
+            self.controller.after_open()
         return True
 
     def get_tag_info(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -240,6 +246,8 @@ class FakeLogixDriver(LogixDriver):
                     results.append(Tag(base, value[:elements], f"{array.group('base')}[{elements}]", None))
             else:
                 results.append(Tag(base, value, data_type, None))
+        if self.controller.after_read is not None:
+            self.controller.after_read()
         return results if len(tags) > 1 else results[0]
 
     def write(self, *tags_values: Any, **kwargs: Any) -> Tag | list[Tag]:
