@@ -16,8 +16,8 @@ By default the mock listens on `127.0.0.1:5025` for newline-delimited JSON reque
 | Request | Answer (`data`) |
 |---|---|
 | `{"op": "read", "tag": "...", "count": N}` | `{tag, value, data_type}`. `count` is optional. Like `pycomm3`, an array tag read without a count returns its first element; with a count of 2 or more, a list and a type such as `REAL[2]`. |
-| `{"op": "write", "tag": "...", "value": ..., "data_type": "..."}` | `{tag, value, data_type}` of what was written. `data_type` is optional and must match the tag's type. The value is type-checked (`REAL` takes a number, `DINT` an integer in range, `BOOL` true/false, `STRING` up to 82 characters). A list writes the leading elements of an array. |
-| `{"op": "list", "program": "..."}` | One `{tag, value, data_type, description}` per tag. Like `pycomm3`'s `get_tag_list`: no `program` lists controller-scoped tags, `"*"` lists all, `"MainProgram"` lists that program's tags. |
+| `{"op": "write", "tag": "...", "value": ..., "data_type": "..."}` | `{tag, value, data_type}` of what was written. `data_type` is optional and must match the tag's type. The value is type-checked (`REAL` takes a number, `DINT` an integer in range, `BOOL` true/false or 1/0, `STRING` up to 82 characters). A list writes the leading elements of an array. |
+| `{"op": "list", "program": "..."}` | One `{tag, data_type, dimensions, tag_type, alias, external_access, description, value}` per tag, the same keys the server reports for a real controller (`data_type` is the element type, `dimensions` the array size). Like `pycomm3`'s `get_tag_list`: no `program` lists controller-scoped tags, `"*"` lists all, `"MainProgram"` lists that program's tags. |
 | `{"op": "info"}` | The mock's identity: `name`, `vendor` (`IndustriAgents (mock)`), `product_name` (`ethernetip-mock-server`), `revision`, `serial`, `keyswitch`. |
 | `{"op": "get_time"}` | `{microseconds}`: the mock's clock, µs since 1970-01-01. |
 | `{"op": "set_time", "microseconds": N}` | Sets the mock's clock (kept as an offset from the host clock until the mock restarts). |
@@ -50,7 +50,7 @@ Point the MCP server at the mock and switch it to the JSON bridge:
 ENIP_HOST=127.0.0.1 ENIP_PORT=5025 ENIP_JSON_BRIDGE=true uv run ethernetip-mcp   # from ../ethernetip-python
 ```
 
-In JSON-bridge mode every tool reaches the mock: tag reads and writes, the tag list, `get_plc_info` (the mock's identity), `get_plc_time` and `set_plc_time` (the mock's clock), and `ping`. Writes still need `ENIP_WRITES_ENABLED=true`, and `set_plc_time` needs `ENIP_SYSTEM_CMDS_ENABLED=true`.
+In JSON-bridge mode every tool reaches the mock: tag reads and writes, the tag list, `get_plc_info` (the mock's identity), `get_plc_time` and `set_plc_time` (the mock's clock), and `ping`. Writes still need `ENIP_WRITES_ENABLED=true`, and `set_plc_time` needs both that and `ENIP_SYSTEM_CMDS_ENABLED=true`.
 
 ## Development
 

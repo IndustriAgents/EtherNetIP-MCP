@@ -30,8 +30,12 @@ application on the office network.
   IndustriConnect suite, this server is **read-only by default**: the write
   tools are refused unless `ENIP_WRITES_ENABLED=true`. Turn it on only for a
   session that needs it, against a controller where that is safe.
-- **Leave system commands off.** `set_plc_time` is refused unless
+- **Leave system commands off.** `set_plc_time` changes the controller, so it
+  is refused unless both `ENIP_WRITES_ENABLED=true` and
   `ENIP_SYSTEM_CMDS_ENABLED=true`. Keep it that way unless you need it.
+- **A write is sent at most once.** If its reply is lost, the server reports
+  that the write may have been applied instead of sending it again; read the
+  tag back before repeating it.
 - **Do not expose the server beyond the host running the client.** It is a
   stdio process meant to run beside the MCP client, not a network service.
 - **Keep the mock on loopback.** The mock's JSON bridge has no authentication
@@ -51,9 +55,9 @@ them up through its `EtherNetIP-Project` submodule.
 
 ## Reporting a vulnerability
 
-Please report privately, by email to hi@industriagents.com. If the
-repository's Security tab offers a **Report a vulnerability** button (GitHub
-private vulnerability reporting), you can use that instead.
+Please report privately, through
+[GitHub private vulnerability reporting](https://github.com/IndustriAgents/EtherNetIP-MCP/security/advisories/new).
+If you cannot use GitHub, email hi@industriagents.com instead.
 
 Please do not open a public issue for a vulnerability.
 

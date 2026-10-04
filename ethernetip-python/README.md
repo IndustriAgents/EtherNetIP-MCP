@@ -45,7 +45,8 @@ ethernetip-python/
 └── tests
     ├── fake_pycomm3.py         # LogixDriver stand-in that enforces pycomm3's real signatures
     ├── test_config.py
-    ├── test_pycomm3_path.py    # pycomm3 call shapes, retries, port/timeout/Micro800
+    ├── test_docs.py            # README covers every setting and breaking change
+    ├── test_pycomm3_path.py    # pycomm3 call shapes, retries, writes sent once, port/timeout/Micro800
     ├── test_tools.py           # tools over an in-memory MCP session
     ├── test_json_bridge.py     # client against the mock PLC (subprocess)
     └── test_integration.py     # ethernetip-mcp over stdio against the mock PLC

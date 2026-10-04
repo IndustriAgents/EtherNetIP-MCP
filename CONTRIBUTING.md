@@ -44,12 +44,16 @@ change that breaks one of these needs a reason in the pull request:
    them.
 2. **Read-only by default.** Tools that write a tag change a running
    controller. They are refused unless `ENIP_WRITES_ENABLED=true`, and system
-   commands such as `set_plc_time` are refused unless
-   `ENIP_SYSTEM_CMDS_ENABLED=true`. A new tool that writes must go through the
-   same guard, and the defaults stay off.
-3. **The mock can answer it.** If you add a tool, the mock has to be able to
+   commands such as `set_plc_time`, which also change the controller, need
+   both that and `ENIP_SYSTEM_CMDS_ENABLED=true`. A new tool that writes must
+   go through the same guard, and the defaults stay off.
+3. **A write is sent at most once.** Only opening the connection may be
+   retried. Pass `repeatable=False` to `_run_cip`/`_json_exchange` for any
+   operation that changes the device, and report a lost reply as
+   `outcome: "unknown"`, never as success and never by re-sending.
+4. **The mock can answer it.** If you add a tool, the mock has to be able to
    answer it, or nobody can test it without a plant.
-4. **Tool names line up with the rest of the suite.** Keep tool and argument
+5. **Tool names line up with the rest of the suite.** Keep tool and argument
    names consistent with the equivalent tools in the other IndustriConnect
    servers.
 
@@ -121,10 +125,14 @@ The test suite in `ethernetip-python/tests` has three layers:
   call against the installed `pycomm3` method signatures and rejects anything
   `pycomm3` would reject. Use it for any change to how the client calls
   `pycomm3`.
-- **JSON-bridge tests** that start the mock PLC on a free port and talk to it.
+- **JSON-bridge tests** that start the mock PLC on a free port and talk to it,
+  plus small in-process bridges that lose or delay replies, to prove a write
+  is never sent twice.
 - **Integration tests** that start the mock and drive the real
   `ethernetip-mcp` process over stdio with the MCP client SDK, including a
   check that nothing but JSON-RPC reaches stdout.
+- **A docs test** that fails if the README's configuration table misses a
+  setting the code reads, or its "Behaviour changes" list misses a tool.
 
 Add a test with every fix or tool change. Then, if you like, drive the server
 the way a user would, through the Inspector or a real MCP client, against the
