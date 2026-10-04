@@ -13,9 +13,9 @@ concurrency:
 permissions:
   contents: read
 
-# Cheap, deterministic checks only: nothing here needs a controller or a
-# running mock. Each folder is its own uv project with a committed uv.lock, and
-# `--locked` fails the run if a lockfile is out of date with its pyproject.toml.
+# Nothing here needs a controller. Each folder is its own uv project with a
+# committed uv.lock, and `--locked` fails the run if a lockfile is out of date
+# with its pyproject.toml.
 jobs:
   server:
     name: MCP server (ethernetip-python)
@@ -30,8 +30,19 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Install dependencies
+      - name: Install dependencies (with the dev extra)
         run: uv sync --locked --extra dev
+
+      # The integration tests start the mock PLC with `uv run --locked`.
+      - name: Install the mock PLC
+        working-directory: ethernetip-mock-server
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run --locked ruff check src tests
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check src tests
 
       - name: Byte-compile sources
         run: uv run --locked python -m compileall -q src
@@ -40,9 +51,7 @@ jobs:
         run: uv run --locked python -c "import ethernetip_mcp; from ethernetip_mcp.cli import main"
 
       # Building the server does not connect: the PLC session is opened in the
-      # MCP lifespan, so this checks tool registration and schemas without a
-      # device. (`ethernetip-mcp --help` is not usable as a check: the entry
-      # point takes no arguments and starts the stdio server.)
+      # MCP lifespan, so this checks tool registration without a device.
       - name: Register MCP tools
         run: |
           uv run --locked python - <<'EOF'
@@ -50,10 +59,20 @@ jobs:
 
           from ethernetip_mcp.server import EtherNetIPMCPServer
 
-          tools = asyncio.run(EtherNetIPMCPServer()._server.list_tools())
+          tools = asyncio.run(EtherNetIPMCPServer().mcp.list_tools())
           assert tools, "no MCP tools registered"
+          missing = [t.name for t in tools if not t.description]
+          assert not missing, f"tools without a description: {missing}"
           print(f"{len(tools)} tools: {', '.join(sorted(t.name for t in tools))}")
           EOF
+
+      # Unit tests (pycomm3 call shapes against a signature-checking fake
+      # driver) plus integration tests that start the mock PLC and drive the
+      # real `ethernetip-mcp` process over stdio with the MCP client SDK.
+      - name: Tests
+        env:
+          ENIP_REQUIRE_INTEGRATION: "1"
+        run: uv run --locked pytest -v
 
   mock:
     name: Mock PLC (ethernetip-mock-server)
@@ -68,8 +87,14 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Install dependencies
-        run: uv sync --locked
+      - name: Install dependencies (with the dev extra)
+        run: uv sync --locked --extra dev
+
+      - name: Lint
+        run: uv run --locked ruff check .
+
+      - name: Check formatting
+        run: uv run --locked ruff format --check .
 
       - name: Byte-compile sources
         run: uv run --locked python -m compileall -q eip_mock_server.py
