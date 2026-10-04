@@ -13,12 +13,14 @@ The MCP tools turn both into ``success: false`` envelopes.
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import json
 import logging
 import math
 import os
 import re
+import socket
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -27,6 +29,7 @@ from typing import Any
 
 import anyio
 from pycomm3 import ClassCode, CommError, LogixDriver, Services
+from pycomm3.cip.status_info import SERVICE_STATUS
 from pycomm3.const import MICRO800_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -67,6 +70,35 @@ class _TransientError(EIPClientError):
 
 class _NotSentError(EIPClientError):
     """A write refused locally, before anything was sent to the device."""
+
+
+class _DeadlineExpired(Exception):
+    """Raised in an abandoned worker thread so it stops instead of retrying."""
+
+
+class _CallState:
+    """Shared by a tool call and its worker thread, to agree on what happened."""
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self.phase = "open"
+        self.cancelled = False
+
+    def check(self) -> None:
+        if self.cancelled:
+            raise _DeadlineExpired
+
+    def enter_operation(self) -> None:
+        with self._guard:
+            if self.cancelled:
+                raise _DeadlineExpired
+            self.phase = "operation"
+
+    def cancel(self) -> str:
+        """Stop the worker; returns the phase it had reached."""
+        with self._guard:
+            self.cancelled = True
+            return self.phase
 
 
 def with_outcome(meta: OperationMeta, outcome: str) -> OperationMeta:
@@ -167,6 +199,7 @@ class EIPClientConfig:
     micro800: bool = False
     debug: bool = False
     write_probe_idle: float = 10.0
+    deadline: float = 0.0  # 0: derived from timeout, retries and backoff
 
     def __post_init__(self) -> None:
         if not self.host:
@@ -191,6 +224,8 @@ class EIPClientConfig:
             raise ConfigError("ENIP_RETRY_BACKOFF_BASE must be 0 or more")
         if self.write_probe_idle < 0:
             raise ConfigError("ENIP_WRITE_PROBE_IDLE must be 0 or more")
+        if self.deadline < 0:
+            raise ConfigError("ENIP_DEADLINE must be 0 (automatic) or more")
         if self.micro800 and self.slot:
             raise ConfigError(
                 "ENIP_SLOT and ENIP_MICRO800 conflict: a Micro800 has no backplane slot, so leave ENIP_SLOT unset"
@@ -232,7 +267,20 @@ class EIPClientConfig:
             micro800=parse_bool(env, "ENIP_MICRO800", False),
             debug=parse_bool(env, "ENIP_DEBUG", False),
             write_probe_idle=_parse_float(env, "ENIP_WRITE_PROBE_IDLE", 10.0, 0.0, 86400.0),
+            deadline=_parse_float(env, "ENIP_DEADLINE", 0.0, 0.0, 86400.0),
         )
+
+    def deadline_s(self) -> float:
+        """Overall limit for one tool call's exchange with the device.
+
+        ENIP_DEADLINE if set, else ENIP_TIMEOUT x (ENIP_MAX_RETRIES + 2) plus
+        the backoff waits plus 15 s, which leaves room for a liveness probe
+        and a reconnect before a write.
+        """
+        if self.deadline > 0:
+            return self.deadline
+        waits = sum(min(self.retry_backoff_base * 2 ** (n - 1), MAX_BACKOFF_S) for n in range(1, self.max_retries + 1))
+        return self.timeout * (self.max_retries + 2) + waits + 15.0
 
     def cip_path(self) -> str:
         """The connection path handed to ``LogixDriver``.
@@ -418,41 +466,100 @@ def _entry(tag: str, value: Any, data_type: Any, error: str | None, outcome: str
     }
 
 
-def _base_type(data_type: str | None) -> str | None:
-    if not data_type:
+def _base_type(data_type: Any) -> str | None:
+    if not isinstance(data_type, str) or not data_type.strip():
         return None
     return data_type.split("[", 1)[0].strip().upper()
 
 
 _NUMERIC_TYPES = {"SINT", "INT", "DINT", "LINT", "USINT", "UINT", "UDINT", "ULINT", "REAL", "LREAL"}
 
-# pycomm3 1.2.14 error texts for a write it refused before sending anything:
-# _parse_requested_tags / _get_tag_info ("Tag doesn't exist", "Failed to parse
-# tag request", "failed to get tag data"), _write_build_single_request
-# ("Invalid Tag Request - ...") and _write_build_multi_requests ("Error
-# encoding value - ..."). Matching is case-sensitive on purpose: "Invalid tag
-# request - ..." (lower case) comes from LogixDriver.write *after* sending.
+# How a failed CIP write is reported, from pycomm3 1.2.14's own texts:
+#
+# not_sent - pycomm3 refused it before sending anything: _parse_requested_tags
+#   and _get_tag_info ("Tag doesn't exist", "Failed to parse tag request",
+#   "failed to get tag data"), the request builders ("Invalid Tag Request - ...",
+#   "Error encoding value - ...", "Failed to build/create request path for
+#   tag"), and CIPDriver.send(), which does not send a request that already has
+#   an error ("No response data received"). Case-sensitive on purpose: "Invalid
+#   tag request - ..." (lower case) is raised after sending.
+# rejected - the controller answered with a CIP general status that refuses
+#   the request before executing it (the allow-list below, built from
+#   pycomm3.cip.status_info so the texts match exactly).
+# unknown  - everything else: a garbled reply ("Failed to parse reply"), the
+#   "Unknown Error" fallback, a fragmented write that failed part-way, partial
+#   transfers, embedded or vendor-specific errors, timeouts, ...
 _LOCAL_WRITE_ERRORS = (
     "Tag doesn't exist",
     "Failed to parse tag request",
     "failed to get tag data",
     "Invalid Tag Request",
     "Error encoding value",
+    "Failed to build request path for tag",
+    "Failed to create request path for tag",
+    "No response data received",
 )
-# Errors after (part of) the request went out: a fragmented write that failed
-# part-way (_send_write_fragmented sends every fragment, then reports this), or
-# a failure while LogixDriver.write assembled the results.
-_FRAGMENT_FAILED = "One or more fragment responses failed"
-_RESULT_ASSEMBLY_FAILED = "Invalid tag request"
+_PRE_EXECUTION_STATUS = (
+    0x02,  # Insufficient resource
+    0x03,  # Invalid value
+    0x04,  # IOI syntax error (path segment error)
+    0x05,  # Destination unknown / object undefined
+    0x08,  # Service not supported
+    0x09,  # Error in data segment or invalid attribute value
+    0x0C,  # Object state conflict
+    0x0E,  # Attribute not settable
+    0x0F,  # Permission denied (privilege violation)
+    0x10,  # Device state conflict
+    0x13,  # Insufficient command data
+    0x14,  # Attribute not supported
+    0x15,  # Too much data
+    0x16,  # Object does not exist
+    0x1A,  # Bridge request too large (never delivered)
+    0x25,  # Key segment error
+    0x26,  # Invalid IOI error (path size)
+    0x28,  # Invalid member ID
+    0x29,  # Member not settable
+)
+# Logix extended codes of general status 0xFF that refuse the request outright.
+_PRE_EXECUTION_GENERAL_ERROR = (
+    0x0007,  # Wrong data type
+    0x2001,  # Excessive IOI
+    0x2002,  # Bad parameter value
+    0x2018,  # Semaphore reject
+    0x201B,  # Size too small
+    0x201C,  # Invalid size
+    0x2100,  # Privilege failure
+    0x2101,  # Invalid keyswitch position
+    0x2102,  # Password invalid
+    0x2103,  # No password issued
+    0x2104,  # Address out of range
+    0x2106,  # Data in use
+    0x2107,  # Tag type used in request does not match the target tag's data type
+    0x2108,  # Controller in upload or download mode
+    0x2109,  # Attempt to change number of array dimensions
+    0x210A,  # Invalid symbol name
+    0x210B,  # Symbol does not exist
+)
+
+
+def _is_pre_execution_refusal(error: str) -> bool:
+    for code in _PRE_EXECUTION_STATUS:
+        text = SERVICE_STATUS[code]
+        if error == text or error.startswith(f"{text} - "):
+            return True
+    general = SERVICE_STATUS[0xFF]
+    if error.startswith(f"{general} - "):
+        return any(error.endswith(f"(ff, {ext:0>2x})") for ext in _PRE_EXECUTION_GENERAL_ERROR)
+    return False
 
 
 def write_error_outcome(error: str) -> str:
-    """Classify a pycomm3 write ``Tag.error`` as not_sent, unknown or rejected."""
-    if _FRAGMENT_FAILED in error or error.startswith(_RESULT_ASSEMBLY_FAILED):
-        return "unknown"
+    """Classify a pycomm3 error for a write-like request: not_sent, rejected or unknown."""
     if any(marker in error for marker in _LOCAL_WRITE_ERRORS):
         return "not_sent"
-    return "rejected"
+    if _is_pre_execution_refusal(error):
+        return "rejected"
+    return "unknown"
 
 
 def _maybe_applied(label: str, detail: str) -> str:
@@ -462,12 +569,14 @@ def _maybe_applied(label: str, detail: str) -> str:
     )
 
 
-def _contains_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return True
-    if isinstance(value, list):
-        return any(_contains_bool(item) for item in value)
-    return False
+def _outcome_error(label: str, error: str) -> EIPClientError:
+    """The exception for a write-like request that came back with ``error``."""
+    outcome = write_error_outcome(error)
+    if outcome == "unknown":
+        return OutcomeUnknownError(_maybe_applied(label, f"the controller's reply did not confirm it ({error})"))
+    if outcome == "not_sent":
+        return EIPClientError(f"{label} refused before sending: {error}")
+    return EIPClientError(f"{label} failed: the controller refused it ({error})")
 
 
 def _split_bit(tag: str) -> tuple[str, bool]:
@@ -479,28 +588,68 @@ def _split_bit(tag: str) -> tuple[str, bool]:
     return tag, False
 
 
-def check_cip_write(driver: Any, tag: str, value: Any) -> None:
+_TRAILING_INDEX = re.compile(r"^(?P<name>.+)\[(?P<index>\d+)\]$")
+
+
+def _bool_into_number(value: Any, info: Mapping[str, Any], path: str) -> str | None:
+    """Find a boolean headed for a numeric tag or structure member; returns where."""
+    if isinstance(value, dict):
+        data_type = info.get("data_type")
+        members = data_type.get("internal_tags") if isinstance(data_type, Mapping) else None
+        if not isinstance(members, Mapping):
+            return None
+        for key, item in value.items():
+            member = members.get(key)
+            if isinstance(member, Mapping):
+                found = _bool_into_number(item, member, f"{path}.{key}")
+                if found:
+                    return found
+        return None
+    if isinstance(value, list):
+        for item in value:
+            found = _bool_into_number(item, info, path)
+            if found:
+                return found
+        return None
+    data_type = info.get("data_type_name")
+    if isinstance(value, bool) and isinstance(data_type, str) and data_type.upper() in _NUMERIC_TYPES:
+        return f"{path} is {data_type}"
+    return None
+
+
+def check_cip_write(driver: Any, tag: str, value: Any, elements: int | None = None) -> None:
     """Refuse, before sending, a write pycomm3 would get wrong or reject.
 
-    Uses the tag definitions pycomm3 uploaded at connect (no network I/O).
-    pycomm3 encodes a boolean into a numeric tag as 1/0 without complaint, so
-    that is refused here: booleans are never accepted as numbers.
+    Uses the tag definitions pycomm3 uploaded at connect (no network I/O):
+    the tag must exist; a boolean is never written into a numeric tag or
+    structure member (pycomm3 would silently write 1/0); and a write to a
+    one-dimensional array must fit inside it, so the controller cannot apply
+    part of it.
     """
     name, is_bit = _split_bit(tag)
     try:
         info = driver.get_tag_info(name) or {}
     except Exception as exc:  # pycomm3 raises RequestError for an unknown tag
         raise _NotSentError(_describe(exc)) from exc
-    if is_bit:
+    if is_bit or not isinstance(info, Mapping):
         return
-    data_type = info.get("data_type_name") if isinstance(info, Mapping) else None
-    if isinstance(data_type, str) and data_type.upper() in _NUMERIC_TYPES and _contains_bool(value):
-        raise _NotSentError(f"{tag} is {data_type}; a boolean is not accepted for a numeric tag")
+    found = _bool_into_number(value, info, tag)
+    if found:
+        raise _NotSentError(f"{found}; a boolean is not accepted for a numeric value")
+    dimensions = info.get("dimensions") or []
+    if info.get("dim") == 1 and dimensions and dimensions[0] and info.get("data_type_name") != "DWORD":
+        match = _TRAILING_INDEX.match(name)
+        start = int(match.group("index")) if match else 0
+        count = elements or 1
+        if start + count > int(dimensions[0]):
+            raise _NotSentError(
+                f"{tag} has {dimensions[0]} elements; writing {count} from index {start} would go past the end"
+            )
 
 
-def _type_warning(requested: str | None, actual: str | None) -> str | None:
+def _type_warning(requested: Any, actual: Any) -> str | None:
     """pycomm3 always encodes with the controller's type; flag a different request."""
-    if requested and _base_type(actual) and _base_type(actual) != _base_type(requested):
+    if _base_type(requested) and _base_type(actual) and _base_type(actual) != _base_type(requested):
         return (
             f"data_type {requested} was given, but the controller tag is {actual}; "
             "pycomm3 encoded the value as the controller type"
@@ -530,6 +679,7 @@ class EIPClient:
         self._last_error: str | None = None
         self._last_contact: float | None = None
         self._last_io = 0.0  # time.monotonic() of the last successful exchange on the CIP session
+        self._active_driver: Any = None  # the driver a worker thread may be blocked in
 
     @property
     def backend(self) -> str:
@@ -546,8 +696,14 @@ class EIPClient:
         """
         if self.config.json_bridge:
             return
+        deadline = self.config.deadline_s()
         try:
-            await anyio.to_thread.run_sync(self._connect_once)
+            try:
+                with anyio.fail_after(deadline):
+                    await anyio.to_thread.run_sync(self._connect_once, abandon_on_cancel=True)
+            except TimeoutError:
+                self._abort_active_socket()
+                raise EIPClientError(f"no complete answer within the {deadline:g} s deadline (ENIP_DEADLINE)") from None
         except Exception as exc:  # noqa: BLE001 - logged, reported by the tools
             message = _describe(exc)
             self._last_error = f"connect: {message}"
@@ -713,7 +869,7 @@ class EIPClient:
             return result, with_outcome(meta, "written")
 
         def _op(driver: Any) -> Any:
-            check_cip_write(driver, base, value)
+            check_cip_write(driver, base, value, split_element_count(request, None)[1])
             # LogixDriver.write(*tags_values) takes (tag, value) tuples and has
             # no data type argument: pycomm3 encodes with the controller's own
             # tag definition. A list is written as Tag{N}.
@@ -721,11 +877,9 @@ class EIPClient:
 
         tag_result, meta = await self._run_cip(label, _op, repeatable=False)
         if tag_result.error:
-            error = str(tag_result.error)
-            outcome = write_error_outcome(error)
-            if outcome == "unknown":
-                raise OutcomeUnknownError(_maybe_applied(label, error), with_outcome(meta, outcome))
-            raise EIPClientError(f"{label} failed: {error}", with_outcome(meta, outcome))
+            failure = _outcome_error(label, str(tag_result.error))
+            failure.meta = with_outcome(meta, write_error_outcome(str(tag_result.error)))
+            raise failure
         actual = tag_result.type
         meta = with_outcome(meta, "written")
         warning = _type_warning(data_type, actual)
@@ -757,7 +911,7 @@ class EIPClient:
             pairs = []
             for index, (base, request, value, _) in enumerate(prepared):
                 try:
-                    check_cip_write(driver, base, value)
+                    check_cip_write(driver, base, value, split_element_count(request, None)[1])
                 except _NotSentError as exc:
                     refused[index] = str(exc)
                     continue
@@ -790,9 +944,7 @@ class EIPClient:
             if tag_result.error:
                 error = str(tag_result.error)
                 outcome = write_error_outcome(error)
-                if outcome == "unknown":
-                    error = _maybe_applied(f"write_tag({base})", error)
-                results.append(_entry(base, value, None, error, outcome))
+                results.append(_entry(base, value, None, str(_outcome_error(f"write_tag({base})", error)), outcome))
                 continue
             entry = _entry(base, value, tag_result.type, None, "written")
             warning = _type_warning(data_type, tag_result.type)
@@ -846,7 +998,9 @@ class EIPClient:
             "set_plc_time", lambda driver: driver.set_plc_time(microseconds=microseconds), repeatable=False
         )
         if tag_result.error:
-            raise EIPClientError(f"set_plc_time failed: {tag_result.error}", with_outcome(meta, "rejected"))
+            failure = _outcome_error("set_plc_time", str(tag_result.error))
+            failure.meta = with_outcome(meta, write_error_outcome(str(tag_result.error)))
+            raise failure
         return plc_time_payload(microseconds), with_outcome(meta, "written")
 
     # -- status ---------------------------------------------------------------
@@ -901,9 +1055,11 @@ class EIPClient:
         """
         driver = self._driver
         if driver is not None and self._connected and getattr(driver, "connected", False):
+            self._active_driver = driver
             return driver
         self._drop_driver_locked()
         driver = self._driver_factory(self.config.cip_path())
+        self._active_driver = driver
         try:
             _apply_socket_timeout(driver, self.config.timeout)
             if not driver.open():
@@ -931,7 +1087,7 @@ class EIPClient:
         if idle < self.config.write_probe_idle:
             return driver
         try:
-            driver.generic_message(
+            reply = driver.generic_message(
                 service=Services.get_attribute_single,
                 class_code=ClassCode.identity_object,
                 instance=1,
@@ -939,13 +1095,16 @@ class EIPClient:
                 connected=True,
                 name="liveness_probe",
             )
+            problem = getattr(reply, "error", None)
         except Exception as exc:  # noqa: BLE001 - any failure means: reconnect first
+            problem = _describe(exc)
+        if problem:
+            # The probe is a read, so reconnecting and going on is safe.
             logger.info(
-                "Session idle %.1f s failed a liveness probe (%s); reconnecting before the write", idle, _describe(exc)
+                "Session idle %.1f s failed a liveness probe (%s); reconnecting before the write", idle, problem
             )
             self._drop_driver_locked()
             return self._open_locked()
-        # A reply, even a CIP error status, shows the session is alive.
         self._last_io = time.monotonic()
         return driver
 
@@ -967,18 +1126,47 @@ class EIPClient:
         self._driver = None
         self._connected = False
 
+    @contextlib.contextmanager
+    def _session(self) -> Any:
+        """Hold the CIP session lock, waiting at most one deadline for it."""
+        if not self._lock.acquire(timeout=self.config.deadline_s()):
+            raise EIPClientError("the CIP session is still busy with an earlier request")
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    def _abort_active_socket(self) -> None:
+        """Unblock a worker stuck in socket I/O after its deadline: close the socket.
+
+        pycomm3 keeps its socket in ``driver._sock.sock``; closing it makes a
+        blocked send/recv fail at once, so the abandoned thread releases the
+        session lock and stops (it checks the cancelled call state).
+        """
+        sock = getattr(getattr(self._active_driver, "_sock", None), "sock", None)
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.close()
+
     def _connect_once(self) -> None:
-        with self._lock:
+        with self._session():
             self._open_locked()
             self._last_contact = time.time()
             self._last_error = None
 
     def _disconnect_sync(self) -> None:
-        with self._lock:
+        with contextlib.suppress(EIPClientError), self._session():
             self._drop_driver_locked()
 
     def _execute_sync(
-        self, label: str, operation: Callable[[Any], Any], repeatable: bool = True
+        self,
+        label: str,
+        operation: Callable[[Any], Any],
+        repeatable: bool = True,
+        state: _CallState | None = None,
     ) -> tuple[Any, OperationMeta]:
         """Run ``operation`` on a connected driver.
 
@@ -989,21 +1177,26 @@ class EIPClient:
         non-repeatable operation, meta always says whether the request was
         sent (``outcome``/``request_sent``) when it fails.
         """
+        state = state or _CallState()
         start = time.perf_counter()
         attempts = 0
         while True:
             attempts += 1
             phase = "open"
             try:
-                with self._lock:
+                with self._session():
+                    state.check()
                     driver = self._open_locked()
                     if not repeatable:
                         driver = self._ensure_live_locked(driver)
+                    state.enter_operation()
                     phase = "operation"
                     result = operation(driver)
                     self._last_contact = time.time()
                     self._last_io = time.monotonic()
                     self._last_error = None
+            except _DeadlineExpired:
+                raise
             except _NotSentError as exc:
                 meta = {
                     "backend": "cip",
@@ -1014,7 +1207,7 @@ class EIPClient:
             except Exception as exc:
                 transient = _is_transient(exc)
                 message = _describe(exc)
-                with self._lock:
+                with self._session():
                     self._last_error = f"{label}: {message}"
                     if transient:
                         # The session is broken: pycomm3's open() would return
@@ -1035,9 +1228,11 @@ class EIPClient:
                         with_outcome(meta, "unknown"),
                     ) from exc
                 if transient and attempts <= self.config.max_retries:
+                    state.check()
                     delay = self._backoff(attempts)
                     logger.info("%s: %s; retrying in %.2f s", label, message, delay)
                     time.sleep(delay)
+                    state.check()
                     continue
                 if not repeatable:
                     meta = with_outcome(meta, "not_sent")
@@ -1054,7 +1249,37 @@ class EIPClient:
     async def _run_cip(
         self, label: str, operation: Callable[[Any], Any], repeatable: bool = True
     ) -> tuple[Any, OperationMeta]:
-        return await anyio.to_thread.run_sync(self._execute_sync, label, operation, repeatable)
+        """Run ``_execute_sync`` in a worker thread, bounded by the overall deadline.
+
+        pycomm3 bounds each socket call by ENIP_TIMEOUT, but a peer that keeps
+        trickling bytes (or a garbled length field) can keep one request going
+        far longer. On expiry the call answers at once: a read fails cleanly,
+        and a write is reported unknown if it may have been sent, not_sent if
+        it was still connecting. The socket is closed to stop the worker.
+        """
+        state = _CallState()
+        deadline = self.config.deadline_s()
+        start = time.perf_counter()
+        try:
+            with anyio.fail_after(deadline):
+                return await anyio.to_thread.run_sync(
+                    self._execute_sync, label, operation, repeatable, state, abandon_on_cancel=True
+                )
+        except TimeoutError as exc:
+            phase = state.cancel()
+            self._abort_active_socket()
+            detail = f"no complete answer within the {deadline:g} s deadline (ENIP_DEADLINE)"
+            self._last_error = f"{label}: {detail}"
+            meta: OperationMeta = {
+                "backend": "cip",
+                "duration_ms": round((time.perf_counter() - start) * 1000.0, 3),
+                "deadline_s": deadline,
+            }
+            if repeatable:
+                raise EIPClientError(f"{label} failed: {detail}", meta) from exc
+            if phase == "operation":
+                raise OutcomeUnknownError(_maybe_applied(label, detail), with_outcome(meta, "unknown")) from exc
+            raise EIPClientError(f"{label} failed: {detail}; nothing was sent", with_outcome(meta, "not_sent")) from exc
 
     # -- JSON bridge internals -----------------------------------------------
 
@@ -1100,18 +1325,22 @@ class EIPClient:
 
         Failing to connect is retried. Once the request may have been sent it
         is repeated only if ``repeatable``; a write whose reply is lost is
-        reported as possibly applied instead (``OutcomeUnknownError``).
+        reported as possibly applied instead (``OutcomeUnknownError``). Each
+        attempt is limited by ENIP_TIMEOUT and the whole exchange, retries
+        included, by the overall deadline (ENIP_DEADLINE).
         """
         start = time.perf_counter()
+        deadline = self.config.deadline_s()
         attempts = 0
         while True:
             attempts += 1
             progress = {"sent": False}
+            limit = min(self.config.timeout, max(deadline - (time.perf_counter() - start), 0.0))
             try:
-                with anyio.fail_after(self.config.timeout):
+                with anyio.fail_after(limit):
                     response = await self._json_request(payload, progress)
             except TimeoutError as exc:
-                failure: EIPClientError = _TransientError(f"no reply within {self.config.timeout} s")
+                failure: EIPClientError = _TransientError(f"no complete reply within {limit:g} s")
                 failure.__cause__ = exc
             except EIPClientError as exc:
                 failure = exc
@@ -1138,8 +1367,10 @@ class EIPClient:
                     with_outcome(meta, "unknown"),
                 ) from failure
             transient = isinstance(failure, _TransientError)
-            if transient and attempts <= self.config.max_retries:
-                await anyio.sleep(self._backoff(attempts))
+            delay = self._backoff(attempts)
+            in_time = (time.perf_counter() - start) + delay < deadline
+            if transient and attempts <= self.config.max_retries and in_time:
+                await anyio.sleep(delay)
                 continue
             if not repeatable:
                 meta = with_outcome(meta, "not_sent")

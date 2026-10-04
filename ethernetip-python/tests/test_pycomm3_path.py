@@ -17,6 +17,7 @@ from collections.abc import Iterator
 import pytest
 from fake_pycomm3 import REAL, FakeController, FakeLogixDriver, bind_real
 from pycomm3 import CommError, LogixDriver, RequestError
+from pycomm3.cip.status_info import EXTEND_CODES, SERVICE_STATUS
 
 from ethernetip_mcp.eip_client import (
     MAX_BACKOFF_S,
@@ -594,8 +595,8 @@ async def test_successful_write_reports_written() -> None:
 
 
 async def test_controller_rejection_reports_rejected_and_sent() -> None:
-    controller = FakeController(write_rejections={"Batch_Count": "Privilege violation"})
-    with pytest.raises(EIPClientError, match="Privilege violation") as info:
+    controller = FakeController(write_rejections={"Batch_Count": "Permission denied"})
+    with pytest.raises(EIPClientError, match="the controller refused it \\(Permission denied\\)") as info:
         await make_client(controller).write_tag("Batch_Count", 3)
     assert_outcome(info.value.meta, "rejected")
     assert len(controller.all_calls("write")) == 1
@@ -644,17 +645,42 @@ async def test_set_plc_time_reports_outcome() -> None:
     assert refused.set_time_calls == []
 
 
+def _general_error(ext: int) -> str:
+    """The text pycomm3 builds for CIP general status 0xFF with a Logix extended code."""
+    return f"{SERVICE_STATUS[0xFF]} - {EXTEND_CODES[0xFF][ext]}  (ff, {ext:0>2x})"
+
+
 @pytest.mark.parametrize(
     "error, outcome",
     [
+        # refused by pycomm3 before anything was sent
         ("Tag doesn't exist - X", "not_sent"),
         ("('Failed to parse tag request', 'X')", "not_sent"),
         ("Invalid Tag Request - RequestError('Unable to create a writable value')", "not_sent"),
         ("Error encoding value - TypeError()", "not_sent"),
+        ("Failed to build request path for tag", "not_sent"),
+        ("Failed to create request path for tag", "not_sent"),
+        ("No response data received", "not_sent"),
+        # refused by the controller before executing it
+        (SERVICE_STATUS[0x0F], "rejected"),
+        (SERVICE_STATUS[0x16], "rejected"),
+        (SERVICE_STATUS[0x05] + " - " + EXTEND_CODES[0x05][0x0000] + "  (05, 00)", "rejected"),
+        (_general_error(0x2107), "rejected"),
+        (_general_error(0x2108), "rejected"),
+        # everything else: the write may have been applied
+        ("Failed to parse reply - unpack requires a buffer of 4 bytes", "unknown"),
+        ("Unknown Error", "unknown"),
+        ("Unknown Error (99)", "unknown"),
         ("One or more fragment responses failed", "unknown"),
         ("Invalid tag request - KeyError(0)", "unknown"),
-        ("Privilege violation", "rejected"),
-        ("Object does not exist", "rejected"),
+        (SERVICE_STATUS[0x06], "unknown"),  # partial transfer
+        (SERVICE_STATUS[0x07], "unknown"),  # connection lost
+        (SERVICE_STATUS[0x1E], "unknown"),  # embedded service error
+        (SERVICE_STATUS[0xFE], "unknown"),  # message timeout
+        (SERVICE_STATUS[0xFF], "unknown"),  # general error without a known code
+        (_general_error(0x2110), "unknown"),  # unable to write
+        (_general_error(0x2105), "unknown"),  # access beyond end of the object
+        ("Privilege violation", "unknown"),  # not a pycomm3 text
     ],
 )
 def test_write_error_classification(error: str, outcome: str) -> None:
@@ -669,7 +695,7 @@ def test_write_error_classification(error: str, outcome: str) -> None:
 )
 async def test_bool_into_numeric_tag_is_refused_before_sending(tag: str, value: object) -> None:
     controller = FakeController()
-    with pytest.raises(EIPClientError, match="a boolean is not accepted for a numeric tag") as info:
+    with pytest.raises(EIPClientError, match="a boolean is not accepted for a numeric value") as info:
         await make_client(controller).write_tag(tag, value)
     assert_outcome(info.value.meta, "not_sent")
     assert controller.all_calls("write") == []
@@ -776,3 +802,204 @@ async def test_failed_reconnect_after_probe_is_not_sent() -> None:
         await client.write_tag("Batch_Count", 14)
     assert_outcome(info.value.meta, "not_sent")
     assert controller.all_calls("write") == []
+
+
+# -- round 3: classification after a send, structures, ranges, deadlines -------
+
+
+@pytest.mark.parametrize(
+    "error, outcome, exc_type",
+    [
+        ("Failed to parse reply - unpack requires a buffer of 4 bytes", "unknown", OutcomeUnknownError),
+        ("Unknown Error", "unknown", OutcomeUnknownError),
+        ("No response data received", "not_sent", EIPClientError),
+        ("Permission denied", "rejected", EIPClientError),
+    ],
+)
+async def test_single_write_uses_the_classifier(error: str, outcome: str, exc_type: type) -> None:
+    controller = FakeController(write_rejections={"Batch_Count": error})
+    with pytest.raises(exc_type) as info:
+        await make_client(controller).write_tag("Batch_Count", 3)
+    assert_outcome(info.value.meta, outcome)
+    if outcome == "unknown":
+        assert "may have been applied" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "error, outcome",
+    [("Failed to parse reply - x", "unknown"), ("Unknown Error", "unknown"), ("Object does not exist", "rejected")],
+)
+async def test_set_plc_time_uses_the_classifier(error: str, outcome: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from pycomm3 import Tag
+
+    controller = FakeController()
+    original = FakeLogixDriver.set_plc_time
+
+    def failing(self: FakeLogixDriver, *args: object, **kwargs: object) -> Tag:
+        original(self, *args, **kwargs)
+        return Tag("set_plc_time", None, None, error)
+
+    monkeypatch.setattr(FakeLogixDriver, "set_plc_time", failing)
+    with pytest.raises(EIPClientError) as info:
+        await make_client(controller).set_plc_time()
+    assert_outcome(info.value.meta, outcome)
+
+
+def struct_controller() -> FakeController:
+    controller = FakeController(structs={"MOTOR_UDT": {"Speed": "REAL", "Running": "BOOL", "Starts": "DINT"}})
+    controller.tags["Motor"] = ({"Speed": 1.0, "Running": False, "Starts": 0}, "MOTOR_UDT")
+    return controller
+
+
+@pytest.mark.parametrize("value", [{"Speed": True}, {"Starts": False}, {"Running": True, "Speed": True}])
+async def test_bool_into_numeric_structure_member_is_refused(value: dict) -> None:
+    controller = struct_controller()
+    with pytest.raises(EIPClientError, match=r"Motor\.(Speed|Starts) is (REAL|DINT); a boolean") as info:
+        await make_client(controller).write_tag("Motor", value)
+    assert_outcome(info.value.meta, "not_sent")
+    assert controller.all_calls("write") == []
+
+
+async def test_structure_with_proper_types_is_written() -> None:
+    controller = struct_controller()
+    _, meta = await make_client(controller).write_tag("Motor", {"Speed": 2.5, "Running": True, "Starts": 3})
+    assert_outcome(meta, "written")
+
+
+@pytest.mark.parametrize(
+    "tag, value", [("Tank_Levels", [1.0, 2.0, 3.0, 4.0]), ("Tank_Levels[2]", [1.0, 2.0]), ("Tank_Levels[3]", 1.0)]
+)
+async def test_array_write_past_the_end_is_refused(tag: str, value: object) -> None:
+    controller = FakeController()
+    with pytest.raises(EIPClientError, match="would go past the end") as info:
+        await make_client(controller).write_tag(tag, value)
+    assert_outcome(info.value.meta, "not_sent")
+    assert controller.all_calls("write") == []
+
+
+def test_array_write_inside_the_array_passes_the_check() -> None:
+    controller = FakeController()
+    make_client(controller)._connect_once()
+    driver = controller.drivers[0]
+    check_cip_write(driver, "Tank_Levels", [1.0, 2.0, 3.0], 3)
+    check_cip_write(driver, "Tank_Levels[1]", [1.0, 2.0], 2)
+    check_cip_write(driver, "Tank_Levels[2]", 1.0, None)
+
+
+async def test_probe_error_reply_also_reconnects() -> None:
+    controller = FakeController(probe_reply_error="Service not supported")
+    client = make_client(controller, write_probe_idle=10.0)
+    await client.ensure_connection()
+    client._last_io -= 60
+    _, meta = await client.write_tag("Batch_Count", 21)
+    assert_outcome(meta, "written")
+    assert probes(controller) == 1 and len(controller.drivers) == 2
+    assert len(controller.all_calls("write")) == 1
+
+
+async def test_deadline_during_a_write_is_unknown_and_frees_the_session() -> None:
+    controller = FakeController(hang_writes=True)
+    client = make_client(controller, deadline=0.5)
+    await client.ensure_connection()
+    start = time.perf_counter()
+    with pytest.raises(OutcomeUnknownError, match="deadline") as info:
+        await client.write_tag("Batch_Count", 22)
+    assert time.perf_counter() - start < 3.0
+    assert_outcome(info.value.meta, "unknown")
+    assert len(controller.all_calls("write")) == 1
+    assert client._lock.acquire(timeout=3.0)  # the worker thread let go of the session
+    client._lock.release()
+
+
+async def test_deadline_while_connecting_for_a_write_is_not_sent() -> None:
+    controller = FakeController(hang_open=True)
+    client = make_client(controller, deadline=0.5, max_retries=3)
+    with pytest.raises(EIPClientError, match="nothing was sent") as info:
+        await client.write_tag("Batch_Count", 23)
+    assert_outcome(info.value.meta, "not_sent")
+    assert controller.all_calls("write") == []
+    assert client._lock.acquire(timeout=3.0)
+    client._lock.release()
+    time.sleep(0.2)
+    assert controller.opens == 1  # the abandoned worker did not retry
+
+
+async def test_deadline_during_a_read_is_a_clean_error() -> None:
+    controller = FakeController(hang_open=True)
+    with pytest.raises(EIPClientError, match="deadline") as info:
+        await make_client(controller, deadline=0.5).read_tag("MotorSpeed")
+    assert not isinstance(info.value, OutcomeUnknownError)
+    assert "outcome" not in info.value.meta
+
+
+async def test_startup_connection_is_bounded_by_the_deadline() -> None:
+    controller = FakeController(hang_open=True)
+    client = make_client(controller, deadline=0.5)
+    start = time.perf_counter()
+    await client.ensure_connection()
+    assert time.perf_counter() - start < 3.0
+    assert "deadline" in client.connection_status()["last_error"]
+
+
+def test_deadline_defaults_cover_retries_and_backoff() -> None:
+    config = EIPClientConfig()
+    assert config.deadline_s() == pytest.approx(5.0 * 5 + (0.5 + 1 + 2) + 15.0)
+    assert EIPClientConfig(deadline=7.0).deadline_s() == 7.0
+
+
+class Trickler:
+    """Answers with an EtherNet/IP header claiming 65535 bytes, then sends one byte every 0.1 s.
+
+    Each recv() returns well inside the socket timeout, so pycomm3 would keep
+    reading for hours; only the overall deadline ends the call.
+    """
+
+    def __init__(self) -> None:
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(8)
+        self.port = self.sock.getsockname()[1]
+        self.closed_by_client = threading.Event()
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._trickle, args=(conn,), daemon=True).start()
+
+    def _trickle(self, conn: socket.socket) -> None:
+        try:
+            conn.recv(1024)  # the RegisterSession request
+            conn.sendall(b"\x65\x00\xff\xff" + b"\x00" * 20)
+            for _ in range(10_000):
+                conn.sendall(b"\x00")
+                time.sleep(0.1)
+        except OSError:
+            self.closed_by_client.set()
+        finally:
+            conn.close()
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+async def test_real_pycomm3_garbled_reply_is_bounded_by_the_deadline() -> None:
+    trickler = Trickler()
+    try:
+        config = EIPClientConfig(port=trickler.port, timeout=0.5, max_retries=0, deadline=1.5)
+        client = EIPClient(config, driver_factory=LogixDriver)
+        start = time.perf_counter()
+        with pytest.raises(EIPClientError, match="deadline"):
+            await client.read_tag("MotorSpeed")
+        assert time.perf_counter() - start < 4.0
+        assert trickler.closed_by_client.wait(5.0)  # the socket was closed, so the worker stopped
+        assert client._lock.acquire(timeout=3.0)
+        client._lock.release()
+        with pytest.raises(EIPClientError, match="nothing was sent") as info:
+            await client.write_tag("MotorSpeed", 1.0)  # stuck while registering the session
+        assert info.value.meta["request_sent"] is False
+    finally:
+        trickler.close()

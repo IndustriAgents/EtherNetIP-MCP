@@ -160,7 +160,7 @@ async def test_bridge_honours_enip_timeout() -> None:
     try:
         client = bridge(hole.getsockname()[1], timeout=0.3)
         start = time.perf_counter()
-        with pytest.raises(EIPClientError, match="no reply within 0.3 s"):
+        with pytest.raises(EIPClientError, match="no complete reply within 0.3 s"):
             await client.read_tag("Line_Speed")
         assert time.perf_counter() - start < 2.0
     finally:
@@ -386,3 +386,42 @@ async def test_failure_during_send_is_unknown_and_never_retried(monkeypatch: pyt
         await client.write_tag("Batch_Count", 1)
     assert info.value.meta["attempts"] == 1 and info.value.meta["request_sent"] is True
     assert len(sends) == 1
+
+
+# -- garbage from the peer is bounded and classified (rule 12) ----------------
+
+
+async def test_garbage_reply_fails_a_read_cleanly() -> None:
+    async def garbage(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        writer.write(b"\x00\xffnot json at all\n")
+
+    async with fake_bridge(garbage) as (port, received):
+        with pytest.raises(EIPClientError, match="undecodable reply") as info:
+            await bridge(port, max_retries=3).read_tag("X")
+    assert not isinstance(info.value, OutcomeUnknownError)
+    assert len(received) == 1  # a garbled reply is not a connection failure: no retry
+
+
+async def test_garbage_reply_to_a_write_is_unknown() -> None:
+    async def garbage(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        writer.write(b"\x00\xffnot json at all\n")
+
+    async with fake_bridge(garbage) as (port, received):
+        with pytest.raises(OutcomeUnknownError, match="may have been applied") as info:
+            await bridge(port, max_retries=3).write_tag("Batch_Count", 1)
+    assert info.value.meta["request_sent"] is True and len(received) == 1
+
+
+async def test_trickling_garbage_is_bounded_by_the_deadline() -> None:
+    async def trickle(request: dict[str, Any], writer: asyncio.StreamWriter) -> None:
+        for _ in range(1000):  # bytes, never a newline
+            writer.write(b"x")
+            await writer.drain()
+            await asyncio.sleep(0.05)
+
+    async with fake_bridge(trickle) as (port, _):
+        client = bridge(port, max_retries=10, retry_backoff_base=0.0, timeout=0.4, deadline=1.0)
+        start = time.perf_counter()
+        with pytest.raises(EIPClientError, match="no complete reply"):
+            await client.read_tag("X")
+        assert time.perf_counter() - start < 2.0  # not 11 x 0.4 s

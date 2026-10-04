@@ -61,7 +61,12 @@ class EnvelopeFastMCP(FastMCP):
             logger.exception("Tool %s raised an unexpected error", name)
             cause = exc.__cause__ or exc
             message = f"Internal error in {name}: {type(cause).__name__}: {cause}"
-            return metadata.convert_result(fail(message, {"tool": name}))
+            meta: dict[str, Any] = {"tool": name}
+            if name in WRITE_TOOLS:
+                # The failure may have come after the request went out.
+                message += ". The write may have been applied; read the value back before trying again."
+                meta.update({"outcome": "unknown", "request_sent": True})
+            return metadata.convert_result(fail(message, meta))
 
 
 @dataclass(slots=True)

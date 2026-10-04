@@ -53,8 +53,12 @@ change that breaks one of these needs a reason in the pull request:
    `outcome: "unknown"`, never as success and never by re-sending, and give
    every write result `outcome` and `request_sent`.
    Safety switches (`*_WRITES_ENABLED`, `*_SYSTEM_CMDS_ENABLED`) are never
-   taken from an automatically found `.env`; only the process environment
-   or `--env-file` can turn them on.
+   taken from the implicit `.env`; only the process environment or
+   `--env-file` can turn them on. The implicit `.env` is
+   `ethernetip-python/.env` only, and may set `ENIP_*`/`TAG_MAP_FILE` only.
+   A failed write is `rejected` only for a CIP status that refuses the
+   request before execution; anything after a possible send is `unknown`.
+   Every device exchange is bounded by the overall deadline.
 4. **The mock can answer it.** If you add a tool, the mock has to be able to
    answer it, or nobody can test it without a plant.
 5. **Tool names line up with the rest of the suite.** Keep tool and argument

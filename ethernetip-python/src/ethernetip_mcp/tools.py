@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from pydantic import Field, StrictInt
 
 from .eip_client import EIPClient, EIPClientError, parse_bool
@@ -42,6 +43,19 @@ WRITE_TOOLS = frozenset(
     {"write_tag", "write_array", "write_string", "write_multiple_tags", "write_tag_by_alias", "set_plc_time"}
 )
 NOT_SENT: dict[str, Any] = {"outcome": "not_sent", "request_sent": False}
+
+# Tool annotations (suite rule 13): nothing that changes the device may
+# advertise idempotency, so clients do not retry a write on their own.
+WRITE_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
+DEVICE_READ_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+LOCAL_READ_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+LOCAL_TOOLS = frozenset({"list_tags", "get_connection_status"})
+
+
+def annotations_for(name: str) -> ToolAnnotations:
+    if name in WRITE_TOOLS:
+        return WRITE_ANNOTATIONS
+    return LOCAL_READ_ANNOTATIONS if name in LOCAL_TOOLS else DEVICE_READ_ANNOTATIONS
 
 
 def envelope(
@@ -233,6 +247,12 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         tag = spec.get("tag")
         if not isinstance(tag, str) or not tag.strip():
             return None, fail(f"Alias '{alias}' has no 'tag' field in the tag map", {"tool": tool, "alias": alias})
+        data_type = spec.get("data_type")
+        if data_type is not None and (not isinstance(data_type, str) or not data_type.strip()):
+            return None, fail(
+                f"Alias '{alias}' has an invalid 'data_type' in the tag map (expected a type name such as REAL)",
+                {"tool": tool, "alias": alias},
+            )
         return spec, None
 
     async def do_read(tool: str, tag_name: str, count: int | None) -> dict[str, Any]:
@@ -254,7 +274,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(str(exc), _error_meta(exc, tool=tool, tag_name=tag_name))
         return ok(result, {**meta, "tool": tool, "tag_name": tag_name})
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("read_tag"))
     async def read_tag(tag_name: TagName, count: ElementCount | None = None) -> dict[str, Any]:
         """Read one tag from the controller.
 
@@ -264,7 +284,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         """
         return await do_read("read_tag", tag_name, count)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("write_tag"))
     async def write_tag(tag_name: TagName, value: Any, data_type: DataType | None = None) -> dict[str, Any]:
         """Write one tag on the controller. Refused unless ENIP_WRITES_ENABLED=true.
 
@@ -280,7 +300,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         """
         return await do_write("write_tag", tag_name, value, data_type)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("read_array"))
     async def read_array(tag_name: TagName, elements: ElementCount) -> dict[str, Any]:
         """Read `elements` consecutive elements of an array tag as a list.
 
@@ -288,7 +308,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         """
         return await do_read("read_array", tag_name, elements)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("write_array"))
     async def write_array(tag_name: TagName, values: Annotated[list[Any], Field(min_length=1)]) -> dict[str, Any]:
         """Write a list of values to consecutive array elements. Refused unless ENIP_WRITES_ENABLED=true.
 
@@ -297,7 +317,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         """
         return await do_write("write_array", tag_name, values, None)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("read_string"))
     async def read_string(tag_name: TagName) -> dict[str, Any]:
         """Read a STRING tag. Fails with success=false if the tag does not hold a string."""
         response = await do_read("read_string", tag_name, None)
@@ -309,12 +329,12 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             )
         return response
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("write_string"))
     async def write_string(tag_name: TagName, value: str) -> dict[str, Any]:
         """Write text to a STRING tag. Refused unless ENIP_WRITES_ENABLED=true."""
         return await do_write("write_string", tag_name, value, None)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("get_tag_list"))
     async def get_tag_list(
         program: Annotated[
             str,
@@ -338,7 +358,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(str(exc), _error_meta(exc, tool="get_tag_list", program=program))
         return ok({"program": program, "tags": tags}, meta)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("read_multiple_tags"))
     async def read_multiple_tags(
         tags: Annotated[list[Annotated[str, Field(min_length=1)]], Field(min_length=1)],
     ) -> dict[str, Any]:
@@ -358,7 +378,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(f"{len(failed)} of {len(results)} reads failed: {detail}", meta, {"results": results})
         return ok({"results": results}, meta)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("write_multiple_tags"))
     async def write_multiple_tags(
         payloads: Annotated[
             list[dict[str, Any]],
@@ -411,7 +431,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             )
         return ok({"results": results}, meta)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("list_tags"))
     async def list_tags() -> dict[str, Any]:
         """List the aliases defined in the TAG_MAP_FILE tag map, with their tags and scaling."""
         aliases = tag_map.list()
@@ -420,7 +440,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         meta = {"tag_map_file": str(tag_map.path) if tag_map.path else None}
         return ok({"aliases": aliases, "count": len(aliases)}, meta)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("read_tag_by_alias"))
     async def read_tag_by_alias(alias: Alias) -> dict[str, Any]:
         """Read the tag behind a tag-map alias, converted to engineering units if the alias defines scaling.
 
@@ -439,7 +459,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(f"Alias '{alias}': {exc}", response["meta"])
         return ok({**data, "alias": alias, "raw_value": data["value"], "value": scaled}, response["meta"])
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("write_tag_by_alias"))
     async def write_tag_by_alias(alias: Alias, value: Any) -> dict[str, Any]:
         """Write the tag behind a tag-map alias. Refused unless ENIP_WRITES_ENABLED=true.
 
@@ -465,7 +485,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return response
         return ok({**response["data"], "alias": alias, "raw_value": raw, "value": value}, response["meta"])
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("ping"))
     async def ping() -> dict[str, Any]:
         """Check that the controller (or mock) answers, by requesting its identity.
 
@@ -489,7 +509,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             meta,
         )
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("get_connection_status"))
     async def get_connection_status() -> dict[str, Any]:
         """Report the configured target and the outcome of the last exchange, without contacting the device.
 
@@ -497,7 +517,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         """
         return ok(client.connection_status())
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("get_plc_info"))
     async def get_plc_info() -> dict[str, Any]:
         """Read the controller identity: name, vendor, product, revision (firmware), serial and keyswitch."""
         try:
@@ -506,7 +526,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(str(exc), _error_meta(exc, tool="get_plc_info"))
         return ok(info, meta)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("get_plc_time"))
     async def get_plc_time() -> dict[str, Any]:
         """Read the controller's wall clock.
 
@@ -519,7 +539,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             return fail(str(exc), _error_meta(exc, tool="get_plc_time"))
         return ok(payload, meta)
 
-    @server.tool()
+    @server.tool(annotations=annotations_for("set_plc_time"))
     async def set_plc_time() -> dict[str, Any]:
         """Set the controller's wall clock to this host's current time.
 

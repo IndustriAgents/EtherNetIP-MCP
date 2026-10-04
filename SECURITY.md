@@ -43,6 +43,9 @@ application on the office network.
   `LD_PRELOAD`, …) are ignored with a warning on stderr, whatever their
   letter case. Enable writes in the MCP client's `env`, or in a file you pass
   explicitly with `--env-file`.
+- **Every device exchange has a deadline.** `ENIP_DEADLINE` bounds each tool
+  call; a write that runs out of time after it may have been sent is reported
+  `unknown`, never retried.
 - **A write is sent at most once.** If its reply is lost, the server reports
   that the write may have been applied (`meta.outcome: "unknown"`,
   `meta.request_sent: true`) instead of sending it again; read the tag back

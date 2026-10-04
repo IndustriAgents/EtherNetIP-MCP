@@ -19,6 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import inspect
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -65,6 +66,13 @@ class FakeController:
     write_rejections: dict[str, str] = field(default_factory=dict)
     # Tag.error returned (after applying) for a write, e.g. a fragmented write.
     write_errors_after_apply: dict[str, str] = field(default_factory=dict)
+    # Structure types: name -> {member: atomic type}.
+    structs: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Block until the socket is closed (by the client's deadline), as a stalled controller would.
+    hang_open: bool = False
+    hang_writes: bool = False
+    # Tag.error the liveness probe gets back (a CIP error reply).
+    probe_reply_error: str | None = None
     drivers: list[FakeLogixDriver] = field(default_factory=list)
     set_time_calls: list[int | None] = field(default_factory=list)
 
@@ -82,6 +90,24 @@ class FakeController:
         return [call for d in self.drivers for call in d.calls if call[0] == name]
 
 
+class _FakeSocket:
+    """Stands in for pycomm3's Socket.sock; closing it wakes a blocked call."""
+
+    def __init__(self) -> None:
+        self.closed = threading.Event()
+
+    def shutdown(self, how: int) -> None:
+        self.closed.set()
+
+    def close(self) -> None:
+        self.closed.set()
+
+
+class _FakeSocketWrapper:
+    def __init__(self) -> None:
+        self.sock = _FakeSocket()
+
+
 class FakeLogixDriver(LogixDriver):
     controller: FakeController
 
@@ -95,6 +121,11 @@ class FakeLogixDriver(LogixDriver):
         self._visible: set[str] | None = None  # tag definitions known to the driver
 
     # -- helpers --------------------------------------------------------------
+
+    def _block(self) -> None:
+        if not self._sock.sock.closed.wait(30):
+            raise AssertionError("nobody closed the socket within 30 s")
+        raise CommError("failed to receive reply: socket closed")
 
     def _maybe_fail(self) -> None:
         if self.controller.op_errors:
@@ -117,6 +148,9 @@ class FakeLogixDriver(LogixDriver):
     def open(self, *args: Any, **kwargs: Any) -> bool:
         bind_real("open", *args, **kwargs)
         self.calls.append(("open", self._cfg["port"], self._cfg["socket_timeout"]))
+        self._sock = _FakeSocketWrapper()
+        if self.controller.hang_open:
+            self._block()
         if self.controller.open_errors:
             raise self.controller.open_errors.pop(0)
         if not self.controller.open_result:
@@ -138,12 +172,28 @@ class FakeLogixDriver(LogixDriver):
             raise RequestError(f"Tag doesn't exist - {base}")
         _, data_type = self.controller.tags[base]
         array = _ARRAY.match(data_type)
-        return {"tag_name": base, "data_type_name": array.group("base") if array else data_type, "tag_type": "atomic"}
+        element = array.group("base") if array else data_type
+        info: dict[str, Any] = {
+            "tag_name": base,
+            "data_type_name": element,
+            "tag_type": "atomic",
+            "dim": 1 if array else 0,
+            "dimensions": [int(array.group("length")), 0, 0] if array else [0, 0, 0],
+        }
+        if element in self.controller.structs:
+            members = {
+                name: {"data_type_name": kind, "data_type": kind, "tag_type": "atomic"}
+                for name, kind in self.controller.structs[element].items()
+            }
+            info.update(tag_type="struct", data_type={"name": element, "internal_tags": members})
+        return info
 
     def generic_message(self, *args: Any, **kwargs: Any) -> Tag:
         bound = bind_real("generic_message", *args, **kwargs)
         self.calls.append(("generic_message", bound.arguments.get("name")))
         self._maybe_fail()
+        if self.controller.probe_reply_error:
+            return Tag(bound.arguments.get("name", "generic"), None, None, self.controller.probe_reply_error)
         return Tag(bound.arguments.get("name", "generic"), b"\x01\x00", None, None)
 
     def close(self, *args: Any, **kwargs: Any) -> None:
@@ -177,6 +227,8 @@ class FakeLogixDriver(LogixDriver):
         bind_real("write", *tags_values, **kwargs)
         self.calls.append(("write", tags_values))
         self._maybe_fail()
+        if self.controller.hang_writes:
+            self._block()
         # Same normalisation and unpacking as LogixDriver.write.
         if len(tags_values) == 2 and isinstance(tags_values[0], str):
             tags_values = ((*tags_values,),)

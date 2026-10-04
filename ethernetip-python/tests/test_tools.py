@@ -424,3 +424,82 @@ async def test_bool_scaling_values_are_refused(tmp_path: Path) -> None:
     async with session(tag_map=path) as s:
         envelope = await call(s, "read_tag_by_alias", {"alias": "x"})
     assert envelope["success"] is False and "not booleans" in envelope["error"]
+
+
+# -- round 3 -------------------------------------------------------------------
+
+
+async def test_internal_error_after_a_write_reports_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = FakeController()
+    client = EIPClient(EIPClientConfig(max_retries=0), driver_factory=controller.factory)
+    original = client.write_tag
+
+    async def write_then_crash(*args: Any, **kwargs: Any) -> Any:
+        await original(*args, **kwargs)  # the controller applied it...
+        raise RuntimeError("bug after the write")  # ...then the server failed
+
+    monkeypatch.setattr(client, "write_tag", write_then_crash)
+    server = EtherNetIPMCPServer(client=client, tool_config=ToolConfig(writes_enabled=True))
+    async with create_connected_server_and_client_session(server.mcp) as s:
+        envelope = await call(s, "write_tag", {"tag_name": "Batch_Count", "value": 9})
+        read = await call(s, "read_tag", {"tag_name": "MotorSpeed"})
+    assert envelope["success"] is False and "Internal error in write_tag" in envelope["error"]
+    assert "may have been applied" in envelope["error"]
+    assert envelope["meta"]["outcome"] == "unknown" and envelope["meta"]["request_sent"] is True
+    assert controller.tags["Batch_Count"] == (9, "DINT")
+    assert read["success"] is True
+
+
+async def test_internal_error_in_a_read_has_no_outcome(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = FakeController()
+    client = EIPClient(EIPClientConfig(max_retries=0), driver_factory=controller.factory)
+
+    async def crash(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(client, "read_tag", crash)
+    server = EtherNetIPMCPServer(client=client, tool_config=ToolConfig())
+    async with create_connected_server_and_client_session(server.mcp) as s:
+        envelope = await call(s, "read_tag", {"tag_name": "MotorSpeed"})
+    assert envelope["success"] is False and "outcome" not in envelope["meta"]
+
+
+@pytest.mark.parametrize("data_type", [5, "", ["REAL"], True])
+async def test_invalid_tag_map_data_type_is_refused_before_writing(tmp_path: Path, data_type: Any) -> None:
+    path = tmp_path / "tags.json"
+    path.write_text(json.dumps({"start": {"tag": "Batch_Count", "data_type": data_type}}))
+    controller = FakeController()
+    async with session(controller, writes=True, tag_map=path) as s:
+        written = await call(s, "write_tag_by_alias", {"alias": "start", "value": 1})
+        read = await call(s, "read_tag_by_alias", {"alias": "start"})
+    assert written["success"] is False and "invalid 'data_type'" in written["error"]
+    assert written["meta"]["outcome"] == "not_sent" and written["meta"]["request_sent"] is False
+    assert read["success"] is False and "invalid 'data_type'" in read["error"]
+    assert controller.all_calls("write") == []
+
+
+async def test_tool_annotations_never_invite_retries() -> None:
+    from ethernetip_mcp.tools import WRITE_TOOLS
+
+    async with session() as s:
+        tools = {tool.name: tool for tool in (await s.list_tools()).tools}
+    assert WRITE_TOOLS == {
+        "write_tag",
+        "write_array",
+        "write_string",
+        "write_multiple_tags",
+        "write_tag_by_alias",
+        "set_plc_time",
+    }
+    for name, tool in tools.items():
+        hints = tool.annotations
+        assert hints is not None, name
+        if name in WRITE_TOOLS:
+            assert hints.readOnlyHint is False, name
+            assert hints.destructiveHint is True, name
+            assert hints.idempotentHint is False, name
+        else:
+            assert hints.readOnlyHint is True, name
+            assert hints.idempotentHint is not False or hints.readOnlyHint, name
+    assert tools["list_tags"].annotations.openWorldHint is False
+    assert tools["read_tag"].annotations.openWorldHint is True
