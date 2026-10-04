@@ -20,6 +20,26 @@ from ethernetip_mcp import package_version
 
 pytestmark = pytest.mark.integration
 
+EXPECTED_TOOL_NAMES = [
+    "read_tag",
+    "write_tag",
+    "read_array",
+    "write_array",
+    "read_string",
+    "write_string",
+    "get_tag_list",
+    "read_multiple_tags",
+    "write_multiple_tags",
+    "list_tags",
+    "read_tag_by_alias",
+    "write_tag_by_alias",
+    "ping",
+    "get_connection_status",
+    "get_plc_info",
+    "get_plc_time",
+    "set_plc_time",
+]
+
 
 @asynccontextmanager
 async def mcp_session(env: dict[str, str], errlog: Path) -> AsyncIterator[tuple[ClientSession, Any]]:
@@ -159,12 +179,37 @@ async def test_server_starts_when_the_controller_is_unreachable(closed_port: int
     assert "Could not connect" in (tmp_path / "server.err").read_text()
 
 
-def test_stdout_carries_only_json_rpc(mock_plc: MockPLC) -> None:
-    """With debug logging on, stdout still holds nothing but JSON-RPC messages."""
-    messages = [
+# One valid call per tool, so every code path that could print runs once.
+ALL_TOOL_CALLS = [
+    ("read_tag", {"tag_name": "Line_Speed"}),
+    ("write_tag", {"tag_name": "Line_Speed", "value": 3.5}),
+    ("read_array", {"tag_name": "Program:MainProgram.Tank_Levels", "elements": 2}),
+    ("write_array", {"tag_name": "Program:MainProgram.Tank_Levels", "values": [1.0, 2.0]}),
+    ("read_string", {"tag_name": "Program:MainProgram.Alarm_Message"}),
+    ("write_string", {"tag_name": "Program:MainProgram.Alarm_Message", "value": "OK"}),
+    ("get_tag_list", {"program": "*"}),
+    ("read_multiple_tags", {"tags": ["Line_Speed", "Batch_Count"]}),
+    ("write_multiple_tags", {"payloads": [{"tag_name": "Batch_Count", "value": 4}]}),
+    ("list_tags", {}),
+    ("read_tag_by_alias", {"alias": "speed"}),
+    ("write_tag_by_alias", {"alias": "speed", "value": 10}),
+    ("ping", {}),
+    ("get_connection_status", {}),
+    ("get_plc_info", {}),
+    ("get_plc_time", {}),
+    ("set_plc_time", {}),
+]
+
+
+def test_stdout_carries_only_json_rpc(mock_plc: MockPLC, tmp_path: Path) -> None:
+    """Unbuffered, with every tool called: a stray print() anywhere must fail this test."""
+    assert sorted(name for name, _ in ALL_TOOL_CALLS) == sorted(EXPECTED_TOOL_NAMES)
+    tag_map = tmp_path / "tags.json"
+    tag_map.write_text(json.dumps({"speed": {"tag": "Line_Speed", "data_type": "REAL"}}))
+    messages: list[dict[str, Any]] = [
         {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": 0,
             "method": "initialize",
             "params": {
                 "protocolVersion": "2025-06-18",
@@ -173,59 +218,54 @@ def test_stdout_carries_only_json_rpc(mock_plc: MockPLC) -> None:
             },
         },
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
-        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {"name": "read_tag", "arguments": {"tag_name": "Line_Speed"}},
-        },
-        {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": {"name": "read_tag", "arguments": {"tag_name": "Nope"}},
-        },
-        {
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {"name": "read_array", "arguments": {"tag_name": "x", "elements": 0}},
-        },
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
     ]
-    process = subprocess.Popen(
-        server_command(),
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={**os.environ, **server_env(**bridge_env(mock_plc), ENIP_DEBUG="true")},
+    for number, (name, arguments) in enumerate(ALL_TOOL_CALLS, start=2):
+        messages.append(
+            {"jsonrpc": "2.0", "id": number, "method": "tools/call", "params": {"name": name, "arguments": arguments}}
+        )
+    env = server_env(
+        **bridge_env(mock_plc),
+        ENIP_DEBUG="true",
+        ENIP_WRITES_ENABLED="true",
+        ENIP_SYSTEM_CMDS_ENABLED="true",
+        TAG_MAP_FILE=str(tag_map),
     )
+    err_path = tmp_path / "server.err"  # a file, so verbose debug logs cannot fill a pipe and block the child
+    with err_path.open("wb") as err_file:
+        process = subprocess.Popen(
+            server_command(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=err_file,
+            env={**os.environ, **env, "PYTHONUNBUFFERED": "1"},
+        )
     responses: dict[int, dict[str, Any]] = {}
+    lines: list[str] = []
     try:
         assert process.stdin and process.stdout
         for message in messages:
             process.stdin.write(json.dumps(message).encode() + b"\n")
             process.stdin.flush()
-            if "id" not in message:
-                continue
-            while message["id"] not in responses:
+            while "id" in message and message["id"] not in responses:
                 line = process.stdout.readline()
                 assert line, "server closed stdout early"
-                parsed = json.loads(line)  # any non-JSON output would fail here
-                assert parsed["jsonrpc"] == "2.0"
+                lines.append(line.decode())
+                parsed = json.loads(line)  # any non-JSON output fails here
                 if "id" in parsed:
                     responses[parsed["id"]] = parsed
         process.stdin.close()
-        rest = process.stdout.read()
+        lines.extend(process.stdout.read().decode().splitlines())
         process.wait(timeout=20)
     finally:
         if process.poll() is None:
             process.kill()
             process.wait()
-    for line in rest.splitlines():
-        assert json.loads(line)["jsonrpc"] == "2.0"
-    stderr = process.stderr.read().decode(errors="replace") if process.stderr else ""
-    assert responses[3]["result"]["structuredContent"]["success"] is True
-    assert responses[4]["result"]["structuredContent"]["success"] is False
-    assert responses[5]["result"]["structuredContent"]["success"] is False
-    assert "DEBUG" in stderr or "Processing request" in stderr  # the logs went to stderr
+    stderr = err_path.read_bytes()
+    for line in lines:
+        assert json.loads(line)["jsonrpc"] == "2.0", line
+    assert sorted(responses) == list(range(len(ALL_TOOL_CALLS) + 2))
+    for number, (name, _) in enumerate(ALL_TOOL_CALLS, start=2):
+        envelope = responses[number]["result"]["structuredContent"]
+        assert envelope["success"] is True, (name, envelope["error"])
+    assert b"DEBUG" in stderr or b"Processing request" in stderr  # the logs went to stderr
