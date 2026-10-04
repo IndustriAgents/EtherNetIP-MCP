@@ -17,6 +17,7 @@ import re
 import signal
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
@@ -59,6 +60,7 @@ class MockConfig:
     port: int = 5025
     update_interval: float = 1.5
     verbose: bool = False
+    parent_pid: int | None = None
 
 
 @dataclass
@@ -347,7 +349,33 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         default=os.getenv("MOCK_ENIP_VERBOSE", "false").strip().lower() in _TRUE,
     )
+    parser.add_argument(
+        "--parent-pid",
+        type=int,
+        default=None,
+        metavar="PID",
+        help="exit when process PID is gone (test harnesses use this so a killed run leaves no mock behind)",
+    )
     return parser.parse_args(argv)
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # exists, owned by someone else
+        return True
+    return True
+
+
+async def _watch_parent(pid: int, stop_event: asyncio.Event, interval: float = 0.5) -> None:
+    while not stop_event.is_set():
+        if not _process_alive(pid):
+            console.print(f"[red]Parent process {pid} is gone; stopping.[/red]")
+            stop_event.set()
+            return
+        await asyncio.sleep(interval)
 
 
 async def run_server(config: MockConfig) -> None:
@@ -359,16 +387,26 @@ async def run_server(config: MockConfig) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, stop_event.set)
+    watcher = asyncio.create_task(_watch_parent(config.parent_pid, stop_event)) if config.parent_pid else None
 
     await stop_event.wait()
+    if watcher is not None:
+        watcher.cancel()
     console.print("\n[red]Shutting down mock server...[/red]")
     await server.stop()
 
 
 def main() -> None:
-    load_dotenv()
+    # Only this directory's .env, never the working directory or a parent.
+    load_dotenv(Path(__file__).resolve().with_name(".env"))
     args = parse_args()
-    config = MockConfig(host=args.host, port=args.port, update_interval=args.update_interval, verbose=args.verbose)
+    config = MockConfig(
+        host=args.host,
+        port=args.port,
+        update_interval=args.update_interval,
+        verbose=args.verbose,
+        parent_pid=args.parent_pid,
+    )
     asyncio.run(run_server(config))
 
 

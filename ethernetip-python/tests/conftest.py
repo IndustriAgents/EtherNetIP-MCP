@@ -73,10 +73,12 @@ def _uv() -> str:
 class MockPLC:
     """The mock PLC from ../ethernetip-mock-server, run with ``uv run --locked``."""
 
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, log_path: Path, parent_pid: int | None = None) -> None:
         self.host = "127.0.0.1"
         self.port = free_port()
         self.log_path = log_path
+        # The mock exits when this process is gone, so a killed test run leaves no orphan.
+        self.parent_pid = os.getpid() if parent_pid is None else parent_pid
         self.process: subprocess.Popen[bytes] | None = None
 
     def start(self) -> MockPLC:
@@ -96,6 +98,8 @@ class MockPLC:
             str(self.port),
             "--update-interval",
             "3600",  # no simulated value changes during a test
+            "--parent-pid",
+            str(self.parent_pid),
         ]
         env = {k: v for k, v in os.environ.items() if not k.startswith("MOCK_ENIP_") and k != "VIRTUAL_ENV"}
         with self.log_path.open("wb") as log:

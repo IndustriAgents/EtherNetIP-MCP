@@ -24,7 +24,7 @@ By default the mock listens on `127.0.0.1:5025` for newline-delimited JSON reque
 
 An unknown tag answers `{"success": false, "error": "Unknown tag 'Name'"}`.
 
-Use `--help` for the configuration flags: `--host`, `--port`, `--update-interval` (seconds between simulated value updates) and `--verbose` (log each connection). The same settings can come from `MOCK_ENIP_HOST`, `MOCK_ENIP_PORT`, `MOCK_ENIP_UPDATE_INTERVAL` and `MOCK_ENIP_VERBOSE`, in the environment or in a `.env` file; they are read when the mock starts.
+Use `--help` for the configuration flags: `--host`, `--port`, `--update-interval` (seconds between simulated value updates), `--verbose` (log each connection) and `--parent-pid PID` (exit when that process is gone; the server's tests use it so a killed test run leaves no mock behind). The same settings can come from `MOCK_ENIP_HOST`, `MOCK_ENIP_PORT`, `MOCK_ENIP_UPDATE_INTERVAL` and `MOCK_ENIP_VERBOSE`, in the environment or in a `.env` file in this directory (no other `.env` is read); they are read when the mock starts.
 
 ## Tags
 

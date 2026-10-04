@@ -142,7 +142,8 @@ The test suite in `ethernetip-python/tests` has three layers:
   call against the installed `pycomm3` method signatures and rejects anything
   `pycomm3` would reject. Use it for any change to how the client calls
   `pycomm3`.
-- **JSON-bridge tests** that start the mock PLC on a free port and talk to it,
+- **JSON-bridge tests** that start the mock PLC on a free port (with
+  `--parent-pid`, so a killed test run leaves no mock behind) and talk to it,
   plus small in-process bridges that lose or delay replies, to prove a write
   is never sent twice.
 - **Integration tests** that start the mock and drive the real

@@ -425,3 +425,22 @@ async def test_trickling_garbage_is_bounded_by_the_deadline() -> None:
         with pytest.raises(EIPClientError, match="no complete reply"):
             await client.read_tag("X")
         assert time.perf_counter() - start < 2.0  # not 11 x 0.4 s
+
+
+def test_mock_exits_when_its_parent_dies(tmp_path: Any) -> None:
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    plc = MockPLC(tmp_path / "orphan.log", parent_pid=parent.pid).start()
+    try:
+        os.kill(parent.pid, signal.SIGKILL)
+        parent.wait(10)
+        assert plc.process is not None
+        plc.process.wait(timeout=15)  # the mock (and uv around it) noticed and exited
+    finally:
+        plc.stop()
+        if parent.poll() is None:
+            parent.kill()
