@@ -4,11 +4,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-compatible-purple)](https://modelcontextprotocol.io)
 
-MCP-based tooling for Rockwell/Allen-Bradley Logix controllers (ControlLogix, CompactLogix) over EtherNet/IP, built on `pycomm3`'s `LogixDriver`. It follows the same layout as the other [IndustriConnect](https://github.com/IndustriAgents/IndustriConnect) protocol servers: a Python MCP server plus a mock PLC, so AI agents can be exercised against simulated controller tags before they go anywhere near real equipment.
+MCP-based tooling for Rockwell/Allen-Bradley Logix controllers (ControlLogix, CompactLogix, Micro800) over EtherNet/IP, built on `pycomm3`'s `LogixDriver`. It follows the same layout as the other [IndustriConnect](https://github.com/IndustriAgents/IndustriConnect) protocol servers: a Python MCP server plus a mock PLC, so AI agents can be exercised against simulated controller tags before they go anywhere near real equipment.
 
-The MCP server exposes consistent tool names and the canonical `{ success, data, error, meta }` response envelope, while the mock PLC provides an in-memory tag database for offline testing.
+The MCP server exposes consistent tool names and the canonical `{ success, data, error, meta }` response envelope, while the mock PLC provides an in-memory tag database for offline testing. The server is **read-only by default**: write tools are refused until you set `ENIP_WRITES_ENABLED=true`.
 
-> **Status: early.** The repository contains complete scaffolding (project metadata, entry points, client wrappers and a first set of tools) so remaining work can focus on feature completion. CI byte-compiles, imports and checks tool registration; the mock-backed path is exercised by hand (see [CONTRIBUTING.md](CONTRIBUTING.md#testing-a-change)). The `pycomm3` path to real controllers has known gaps: the write tools, `read_array` and `get_plc_info` do not work on it yet, so writes currently work only against the mock. See [Known limitations](#known-limitations), and validate on a bench controller before relying on it.
+> **Status: early.** CI runs `ruff`, unit tests and end-to-end tests: the tests start the mock PLC and drive the real `ethernetip-mcp` process over stdio with the MCP client SDK. The `pycomm3` path to real controllers is unit-tested against a fake driver that enforces `pycomm3`'s real method signatures, and its port, timeout and retry handling are tested with the real `LogixDriver` against a local socket. It has **not** been run against a physical controller from this repository yet. Validate on a bench controller before relying on it; see [Known limitations](#known-limitations).
 
 ## Repository Layout
 
@@ -18,14 +18,14 @@ EtherNetIP-MCP/               # included in IndustriConnect as the EtherNetIP-Pr
 ├── LICENSE
 ├── CONTRIBUTING.md · SECURITY.md · CODE_OF_CONDUCT.md
 ├── .github/                  # CI, Dependabot, issue and PR templates
-├── ethernetip-python/        # Python MCP server (uv)
+├── ethernetip-python/        # Python MCP server (uv), tests in ethernetip-python/tests
 └── ethernetip-mock-server/   # EtherNet/IP mock PLC (uv, JSON-over-TCP)
 ```
 
 ## Components
 
-- **[ethernetip-python](ethernetip-python/)**: Python 3.11+ server built with `pycomm3`, `mcp[cli]`, and `uv`. Ships the `ethernetip-mcp` entry point.
-- **[ethernetip-mock-server](ethernetip-mock-server/)**: Python mock PLC with a small in-memory tag database (controller-style `Program:` tags: scalars, an array and a string). It speaks a simple JSON-over-TCP protocol rather than CIP, which the server reaches through its JSON bridge (`ENIP_JSON_BRIDGE=true`).
+- **[ethernetip-python](ethernetip-python/)**: Python 3.11+ server built with `pycomm3`, `mcp[cli]` (1.x) and `uv`. Ships the `ethernetip-mcp` entry point.
+- **[ethernetip-mock-server](ethernetip-mock-server/)**: Python mock PLC with a small in-memory tag database (two controller-scoped tags and five `Program:MainProgram` tags: scalars, an array and a string). It speaks a simple JSON-over-TCP protocol rather than CIP, which the server reaches through its JSON bridge (`ENIP_JSON_BRIDGE=true`).
 
 ## Install
 
@@ -46,7 +46,14 @@ uv sync
 uv run ethernetip-mock-server
 ```
 
-Then register the server with your MCP client. It speaks MCP over stdio; this config points it at the mock through the JSON bridge, read-only:
+Install the server once, so the MCP client does not have to create its virtual environment (and possibly download Python) inside its startup timeout:
+
+```bash
+cd ethernetip-python
+uv sync
+```
+
+Then register the server with your MCP client. It speaks MCP over stdio; this config points it at the mock through the JSON bridge:
 
 ```json
 {
@@ -57,35 +64,49 @@ Then register the server with your MCP client. It speaks MCP over stdio; this co
       "env": {
         "ENIP_HOST": "127.0.0.1",
         "ENIP_PORT": "5025",
-        "ENIP_JSON_BRIDGE": "true",
-        "ENIP_WRITES_ENABLED": "false"
+        "ENIP_JSON_BRIDGE": "true"
       }
     }
   }
 }
 ```
 
-To try it without a client, use the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector); see [CONTRIBUTING.md](CONTRIBUTING.md#getting-set-up).
+GUI clients such as Claude Desktop often start without `~/.local/bin` on their `PATH`. If the client cannot find `uv`, put the absolute path printed by `which uv` in `command`.
 
-For a real controller, drop `ENIP_JSON_BRIDGE` and `ENIP_PORT`, and set `ENIP_HOST` to the controller (or the Ethernet module in its chassis) and `ENIP_SLOT` to the processor slot. Read [SECURITY.md](SECURITY.md) first, and [Known limitations](#known-limitations): writes do not work on that path yet.
+This config is read-only: the write tools answer `success: false` until you add `"ENIP_WRITES_ENABLED": "true"`. To try it without a client, use the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector); see [CONTRIBUTING.md](CONTRIBUTING.md#getting-set-up).
+
+For a real controller, drop `ENIP_JSON_BRIDGE` and `ENIP_PORT`, and set `ENIP_HOST` to the controller (or the Ethernet module in its chassis) and `ENIP_SLOT` to the processor slot; for a Micro800 set `ENIP_MICRO800=true` instead of a slot. Read [SECURITY.md](SECURITY.md) and [Known limitations](#known-limitations) first.
 
 ## Configuration
 
-Set these in the client config's `env`, in the environment, or in a `.env` file in `ethernetip-python/` (git-ignored).
+Set these in the client config's `env` or the process environment. The server reads them when it starts; an invalid value (a port that is not a number, `ENIP_WRITES_ENABLED=ture`, conflicting settings) stops the server at startup with a `configuration error` message on stderr and exit code 2. An empty value counts as unset.
+
+**Where settings come from.** The server reads the process environment (the MCP client's `env`) and, optionally, two kinds of file:
+
+- `ethernetip-mcp --env-file PATH` reads the file you name, and honours every setting in it, safety switches included.
+- Without `--env-file`, the server loads one `.env` by itself, and only `ethernetip-python/.env` of a source checkout. It looks in that project directory, found from the package's own location, and **never** in the working directory or a parent directory; an installed package (site-packages) has no implicit `.env` at all. The working directory is usually the MCP client's project, which this server should not trust, and settings such as the host or the tag map decide where a write goes. Even that file may only set this server's own settings (`ENIP_*` and `TAG_MAP_FILE`) and may **not** enable a safety switch: `ENIP_WRITES_ENABLED`, `ENIP_SYSTEM_CMDS_ENABLED` and any other variable in it (`PATH`, `PYTHONPATH`, `LD_PRELOAD`, proxy settings, …) are ignored with a warning on stderr naming the variable. Names are compared case-insensitively, as Windows does, and an `export` prefix makes no difference.
+
+Variables already set in the environment always win over either file. [`ethernetip-python/.env.example`](ethernetip-python/.env.example) lists the settings.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ENIP_HOST` | `127.0.0.1` | Controller IP address, or the mock's host. |
-| `ENIP_SLOT` | `0` | Processor slot in the chassis. |
-| `ENIP_PATH` | unset | Full CIP route (e.g. `10.0.0.5/backplane/2`); overrides host and slot. |
-| `ENIP_PORT` | `44818` | Port for the JSON bridge: set it to the mock's port (`5025`). The CIP path ignores it and uses 44818. |
-| `ENIP_TIMEOUT` | `10` | Meant as the connection timeout in seconds. Currently ignored (see [Known limitations](#known-limitations)). |
+| `ENIP_HOST` | `127.0.0.1` | Controller IPv4 address or host name, or the mock's host. May include a port (`10.0.0.5:44819`). The JSON bridge also accepts IPv6 (`::1`, `[::1]:5025`); the CIP path is IPv4 only, as `pycomm3` is. |
+| `ENIP_PORT` | `44818` | TCP port, for both backends: set it to the mock's port (`5025`) for the JSON bridge. A port written into `ENIP_HOST` or `ENIP_PATH` also works; if both are given they must agree. |
+| `ENIP_SLOT` | `0` | Processor slot in the chassis (0–255). Not used with `ENIP_PATH` or `ENIP_MICRO800`. |
+| `ENIP_PATH` | unset | Full CIP route (e.g. `10.0.0.5/backplane/2`); overrides `ENIP_HOST` and `ENIP_SLOT`. Not allowed with the JSON bridge. |
+| `ENIP_MICRO800` | `false` | The target is a Micro800: connect to the IP alone (a non-zero `ENIP_SLOT` is a configuration error), and refuse the connection if the controller does not identify as a Micro800 (catalog `2080-*`). `pycomm3` detects a Micro800 on its own either way; `get_connection_status` shows what it detected. |
+| `ENIP_TIMEOUT` | `5` | Seconds. On the CIP path, the socket timeout for connecting and for each reply (`pycomm3`'s own default is also 5 s). On the JSON bridge, the limit for each request. |
 | `ENIP_JSON_BRIDGE` | `false` | Talk to the mock's JSON-over-TCP protocol instead of CIP. |
-| `ENIP_MAX_RETRIES` | `3` | Retries per operation, with exponential backoff. |
-| `ENIP_RETRY_BACKOFF_BASE` | `0.5` | Base delay of that backoff, in seconds: retry *n* waits this × 2<sup>n−1</sup>. |
-| `ENIP_WRITES_ENABLED` | `true` | **Writes are on by default.** Set `false` for a read-only server. |
-| `ENIP_SYSTEM_CMDS_ENABLED` | `false` | Allows `set_plc_time`. |
+| `ENIP_MAX_RETRIES` | `3` | Retries (0–10) for connection-level failures: a call makes at most this + 1 attempts. Reads may be re-sent. A write or `set_plc_time` is retried only while the connection is being opened, never once its request may have been sent (see [Writes are sent at most once](#writes-are-sent-at-most-once)). Errors the device reports (unknown tag, wrong type) are not retried. |
+| `ENIP_RETRY_BACKOFF_BASE` | `0.5` | Base delay of the retry backoff, in seconds (0–60): retry *n* waits this × 2<sup>n−1</sup>, capped at 30 s per wait. |
+| `ENIP_WRITES_ENABLED` | `false` | Allows the write tools, and is one of the two settings `set_plc_time` needs. Off by default: a model will call a tool it has been given. Ignored in an automatically found `.env`. |
+| `ENIP_SYSTEM_CMDS_ENABLED` | `false` | Allows system commands. `set_plc_time` changes the controller, so it needs both this and `ENIP_WRITES_ENABLED=true`. Ignored in an automatically found `.env`. |
+| `ENIP_WRITE_PROBE_IDLE` | `10` | Seconds. Before a write or `set_plc_time` on a CIP session idle at least this long, read the controller's identity first (a liveness probe that is safe to repeat); if it fails or the controller answers with an error, reconnect, then send the write once. `0` probes before every write. |
+| `ENIP_DEADLINE` | automatic | Seconds: the most one tool call may spend talking to the device, counted from the start of the call. Everything the call does shares it: waiting for the session, the liveness probe, reconnecting, retries, and every entry of a batch. Nothing is sent after it has passed: batch entries not yet sent then are `not_sent` (`read_multiple_tags` reports them as not read), and the one in flight is `unknown`. `0` or unset means `ENIP_TIMEOUT` × (`ENIP_MAX_RETRIES` + 2) + the backoff waits + 15 s (about 43 s with the defaults). When it expires, a read fails cleanly and a write is reported `unknown` (or `not_sent` if it was still connecting). Raise it if the first connection to a large controller (which uploads the whole tag list) takes longer. |
+| `ENIP_DEBUG` | `false` | Debug logging, including `pycomm3`'s, on stderr. |
 | `TAG_MAP_FILE` | unset | JSON file of tag aliases with optional scaling, used by `list_tags` and the `*_by_alias` tools. |
+
+The server connects once at startup. If the controller does not answer, it logs a warning on stderr and starts anyway; each tool call then reconnects and reports its own error, so the model sees `success: false` instead of a failed server.
 
 A tag map maps an alias to a controller tag, optionally with linear scaling between raw and engineering units:
 
@@ -100,37 +121,88 @@ A tag map maps an alias to a controller tag, optionally with linear scaling betw
 }
 ```
 
+`read_tag_by_alias` returns both `raw_value` and the scaled `value`; `write_tag_by_alias` takes engineering units and rounds the raw value for integer types (`SINT` to `ULINT`). A missing or malformed tag map file, a scaling with a zero span, or a non-numeric value on a scaled alias is reported as `success: false`.
+
 ## Tools
 
-All tools return `{ success, data, error, meta }`.
+All tools return `{ success, data, error, meta }`. `success` is `true` only when the device confirmed the operation; `meta` carries the backend, the number of attempts and the duration.
 
 - **Tags:** `read_tag`, `write_tag`, `read_array`, `write_array`, `read_string`, `write_string`, `read_multiple_tags`, `write_multiple_tags`
-- **Discovery:** `get_tag_list`
+- **Discovery:** `get_tag_list` (no `program`: controller-scoped tags; `"*"`: all tags; a program name: that program's tags)
 - **Tag map aliases:** `list_tags`, `read_tag_by_alias`, `write_tag_by_alias`
 - **PLC info and time:** `get_plc_info`, `get_plc_time`, `set_plc_time`
-- **Health:** `ping`, `get_connection_status`
+- **Health:** `ping` (asks the device for its identity), `get_connection_status` (last known state, no I/O)
 
-Against a real controller, the write tools, `read_array` and `get_plc_info` do not work yet; see [Known limitations](#known-limitations).
+Some details:
+
+- A read returns `data: {tag, value, data_type}`. Array elements follow `pycomm3`: `read_array` (or `read_tag` with `count`, or the `Tag{N}` syntax) returns a list of N elements; reading an array tag without a count returns one element.
+- A write returns `data: {tag, value, data_type}`, where `data_type` is the type the device used. A list written with `write_tag` or `write_array` goes to consecutive elements (`Tag{N}`). Pass an object to write a structure.
+- `read_multiple_tags` returns one `{tag, value, data_type, error}` entry per tag; if any read failed, `success` is `false` and `data.results` shows which.
+- `write_multiple_tags` always returns `data.results`, one `{tag, value, data_type, error, outcome, request_sent}` entry per payload. `outcome` is `written`, `rejected` (the device refused it), `unknown` (it may have been applied; read it back) or `not_sent`. `success` is `true` only if every entry was written. Batch writes are not atomic; on the JSON bridge the batch stops at the first connection failure and marks the rest `not_sent`.
+- `get_tag_list` returns `{tag, data_type, dimensions, tag_type, alias, external_access, description}` per tag on both backends. `data_type` is the element type and `dimensions` the array size (`[]` for a scalar). `description` is always `null` on a real controller, because `pycomm3` does not read tag descriptions.
+- Bad arguments (a missing tag name, `elements: 0`, an empty list, a duplicate tag in a batch) come back as `success: false` with `Invalid arguments for <tool>: ...`, not as a protocol error. Counts are strict integers: `true`, `"2"` and `2.0` are refused.
+- A boolean is never written into a numeric tag or structure member (`SINT` … `ULINT`, `REAL`, `LREAL`): `pycomm3` would silently write 1 or 0, so the server refuses it before sending. Booleans are fine for `BOOL` tags, `BOOL` members and bits (`Word.3`).
+- A write to a one-dimensional array must fit: writing past its end (`Tank_Levels[2]` with three values into a 3-element array) is refused before sending, so the controller can never apply part of it.
+- Tool annotations: the write tools and `set_plc_time` are marked `destructiveHint: true` and `idempotentHint: false`, so clients have no reason to retry them; the other tools are `readOnlyHint: true`.
+- `get_plc_time` returns `data: {plc_time, microseconds}`; `set_plc_time` sets the controller clock to this host's current time and needs both `ENIP_WRITES_ENABLED=true` and `ENIP_SYSTEM_CMDS_ENABLED=true`.
+
+### Writes are sent at most once
+
+A write (`write_tag`, `write_array`, `write_string`, `write_tag_by_alias`, `write_multiple_tags`) or `set_plc_time` is never sent twice by the server. If opening the connection fails, nothing was sent and that part is retried. If the connection fails after the request may have gone out, for example because the reply was lost or timed out, the tool answers `success: false` with `meta.outcome: "unknown"` (per entry in a batch) and an error saying the write may have been applied. Read the tag back before writing again: re-sending could re-trigger a command or handshake bit.
+
+Every write result says what happened: `meta.outcome` (per entry in a batch) is `written`, `rejected`, `unknown` or `not_sent`, and `meta.request_sent` is `true` for the first three and `false` for `not_sent`. On a real controller:
+
+- `not_sent`: refused before anything was sent, by the server's own checks (unknown tag, a boolean for a number, a write past the end of an array) or by `pycomm3` while building the request (a value it cannot encode for the tag's type).
+- `rejected`: only for a CIP status that refuses the request before the controller executes it, such as *Permission denied*, *Object does not exist*, *Invalid value* or the Logix codes for a wrong data type or the controller being in download mode. The list is built from `pycomm3`'s own status tables.
+- `unknown`: everything else, including a garbled reply (`Failed to parse reply`), `pycomm3`'s `Unknown Error`, a large write `pycomm3` split into fragments that failed part-way, partial transfers, timeouts, the overall deadline expiring after sending, and an internal error after the write was attempted.
+
+`pycomm3` reports these cases as error text, so the classification follows `pycomm3` 1.2.14's messages (the dependency is pinned below 1.3). On the JSON bridge, the mock checks a request completely before applying it, so its refusals are `rejected`.
+
+A write that has not been sent yet is also never sent after the MCP client gives up on it. This covers a write that is queued behind another call, still connecting, or waiting to retry, when the client cancels the call (`notifications/cancelled`) or disconnects (closes stdin). When the client disconnects, the server cancels every pending call, sends nothing more to the device, and exits. The last check before every send also reads the MCP request's own cancel flag, so a cancel that arrives in the very moment a connection or the session becomes free still stops the write. A write already on its way is not recalled. The client has been told the call was cancelled, so the server logs on stderr what happened instead: "nothing was sent", or the outcome if the request had already gone out.
+
+On the CIP path, a session that has been idle for `ENIP_WRITE_PROBE_IDLE` seconds (default 10) is checked before a write with a cheap identity read. If the controller dropped it, the server reconnects first, so the write goes out once on a working session instead of failing as `unknown`.
 
 ## Known limitations
 
-These are open bugs in the `pycomm3` path, the one that talks CIP to a real controller. The JSON bridge to the mock is not affected unless stated.
+- **Not yet run against a physical controller.** The `pycomm3` calls are checked against `pycomm3`'s real signatures and behaviour as read from its source (1.2.14), but no CIP traffic has been exchanged with a Logix controller from this repository. Bench-test before relying on it.
+- **`data_type` is not enforced on the CIP path.** `pycomm3` always encodes a write with the controller's own type for the tag; it has no data type argument. If the `data_type` you pass (or the tag map's) differs, the write still uses the controller's type and the response carries a `meta.warning` (or a per-entry `warning` in batches). The mock refuses a mismatched `data_type`.
+- **`ENIP_TIMEOUT` depends on a `pycomm3` internal.** `pycomm3` 1.2.14 has no setting for its socket timeout (its `socket_timeout` setter writes a misspelled key), so the server sets `_cfg["socket_timeout"]` before connecting. The dependency is pinned to `pycomm3>=1.2.14,<1.3`; a test fails if that changes.
+- **A failing call can take a while.** With the defaults, an unreachable controller that drops packets costs up to 4 attempts × `ENIP_TIMEOUT` (5 s) plus 3.5 s of backoff, about 24 s, before the tool answers; a refused connection fails within the 3.5 s of backoff. Each backoff wait is capped at 30 s. Lower `ENIP_MAX_RETRIES` (for example `0` against the mock) for faster answers.
+- **A session can still die between the probe and the write.** The liveness probe catches a session dropped while idle, but if the connection breaks between the probe (or a recent call) and the write, the write fails with `outcome: "unknown"` even if it never arrived, because the server cannot tell that apart from a lost reply. Read the tag and call the tool again. The probe itself (a connected Get_Attribute_Single of the identity object) has not been run against a physical controller yet.
+- **The mock is not a controller.** It speaks JSON over TCP, not CIP, and has no structures (UDTs), no array element indexing (`Tag[1]`), and a single program. See [its README](ethernetip-mock-server/README.md).
+- **mcp 1.x only.** The server uses `mcp.server.fastmcp`, which mcp 2.x renamed, so `mcp` is pinned to `<2`. It also reads the request's cancel scope from mcp 1.x internals (`session._in_flight[...]._cancel_scope`); a test fails if they move.
 
-- **Writes fail.** `write_tag`, `write_array`, `write_string`, `write_tag_by_alias` and `write_multiple_tags` call `LogixDriver.write()` with arguments it does not accept, so each one fails with a `TypeError`, after retrying and reconnecting `ENIP_MAX_RETRIES` times. **Writes currently work only against the mock.**
-- **Array reads fail.** `read_array`, and `read_tag` when given `count`, pass a `count=` argument that `LogixDriver.read()` does not accept, and fail with a `TypeError`.
-- **`get_plc_info` returns empty fields.** It reads `LogixDriver.info`, a dict, as if it were an object, so `name`, `revision`, `serial`, `product_code` and `firmware` all come back `null`. Against the mock it fails outright, as it has no JSON-bridge path.
-- **Some settings are ignored.** `ENIP_PORT`, `ENIP_TIMEOUT` and `ENIP_MICRO800` never reach `pycomm3`, which always connects to port 44818 with its own 10 s timeout and detects a Micro800 from the controller's identity. `ENIP_MICRO800` only stops `ENIP_SLOT` from being added to the route, and `ENIP_TIMEOUT` does not apply to the JSON bridge either. `ENIP_INIT_INFO`, `ENIP_CACHE_TAG_LIST`, `ENIP_CACHE_TIMEOUT` and `ENIP_DEBUG` are read but change nothing.
+### Behaviour changes in this version
 
-The other tools that reach the controller (`read_tag` without `count`, `read_string`, `read_multiple_tags`, `get_tag_list`, `read_tag_by_alias`, `get_plc_time` and `set_plc_time`) call `pycomm3` with arguments its API accepts, but none of them has been run against a controller from this repository yet.
+If you used an earlier commit, these changed (the old shapes were not kept):
+
+- **Gates:** writes are off by default (`ENIP_WRITES_ENABLED=false`), and `set_plc_time` needs both `ENIP_WRITES_ENABLED=true` and `ENIP_SYSTEM_CMDS_ENABLED=true`. An automatically found `.env` can no longer turn either on; use the client's `env` or `--env-file`.
+- **Write results:** single writes and `set_plc_time` always carry `meta.outcome` and `meta.request_sent`; batch entries carry `outcome` and `request_sent`. Booleans are no longer accepted as counts or written into numeric tags or members.
+- **`.env`:** only `ethernetip-python/.env` of a source checkout is loaded implicitly (never the working directory or a parent), and only for `ENIP_*` and `TAG_MAP_FILE` settings.
+- **Deadline:** every tool call's exchange with the device is bounded by `ENIP_DEADLINE`.
+- **Retries:** writes and `set_plc_time` are never re-sent once the request may have reached the device; a lost reply gives `success: false` with `meta.outcome: "unknown"`.
+- **Settings:** `ENIP_TIMEOUT` defaults to 5 s and now takes effect, as do `ENIP_PORT` and `ENIP_MICRO800` on the CIP path. `ENIP_INIT_INFO`, `ENIP_CACHE_TAG_LIST` and `ENIP_CACHE_TIMEOUT`, which never did anything, are no longer read. Invalid settings stop the server at startup (exit code 2). The server no longer exits when the controller is unreachable at startup.
+- **`read_tag` / `read_array`:** `data: {tag, value, data_type}` (plus `elements` with a count) instead of `data: {tag, result: {tag, value, data_type, status, error}}`.
+- **`write_tag` / `write_array` / `write_string`:** `data: {tag, value, data_type}` instead of `data: {tag, written}`.
+- **`write_multiple_tags`:** `data: {results: [{tag, value, data_type, error, outcome}]}` instead of `data: {written: [{tag, value, data_type}]}`, and `success: false` if any entry was not written.
+- **`read_multiple_tags`:** `success: false` if any read failed (on the CIP path it used to be `true` with errors inside the entries; on the bridge the first error failed the whole call and dropped the other results), and the entries no longer have a `status` field.
+- **`list_tags`:** entries also carry `scaling`; a missing or malformed tag map file is an error instead of an empty list.
+- **`read_string`:** fails on a value that is not a string, instead of converting it with `str()`.
+- **`read_tag_by_alias` / `write_tag_by_alias`:** `data` has the read or write fields plus `alias`, `raw_value` (controller units) and `value` (engineering units).
+- **`get_tag_list`:** entries are `{tag, data_type, dimensions, tag_type, alias, external_access, description}` on both backends, instead of raw `pycomm3` definitions (which could not be serialised) or the mock's `{tag, value, data_type, description}`.
+- **`get_plc_info`:** `{name, vendor, product_type, product_code, product_name, revision, firmware, serial, keyswitch}`, filled in (the fields used to be `null`).
+- **`get_plc_time`:** `{plc_time, microseconds}` instead of a nested `{plc_time: {...}}`. **`set_plc_time`:** `{updated, plc_time, microseconds}`.
+- **`ping`:** contacts the device and fails if it does not answer; `data` is `{reachable, latency_ms, product_name, connection, writes_enabled, system_cmds_enabled, tag_aliases}`.
+- **`get_connection_status`:** `path` is renamed `route`; new fields `backend`, `last_contact`, `last_error`, and on the CIP path `connection_path`, `micro800_detected` and `timeout_s`. On the JSON bridge the CIP-only fields (`slot`, `route`, `micro800`) are left out, a `note` is added, and `connected` reflects the last request.
+- **Bad arguments** come back as `success: false` envelopes instead of protocol-level tool errors.
+- **The mock:** `get_plc_info` and the clock tools work against it; `get_tag_list` without `program` lists only its controller-scoped tags; reading an array tag without a count returns one element, as on a controller; writes are type-checked.
 
 ## Planned Capabilities
 
-- Tag operations: scalar, arrays, strings, structures, batch read/write
-- Tag discovery: controller/program tag lists, UDT definitions, module info
-- PLC info: controller identity, firmware, time, module inventory
-- Tag map aliases with scaling metadata
-- Health + session control (`ping`, `get_connection_status`, `forward_open`, `forward_close`)
-- Mock PLC with deterministic tag database for offline testing
+- Tag operations: structures (UDTs) in the mock, module info
+- Tag discovery: UDT definitions, module inventory
+- Session control (`forward_open`, `forward_close`)
+- A CIP front end for the mock PLC
 
 ## Part of IndustriConnect
 

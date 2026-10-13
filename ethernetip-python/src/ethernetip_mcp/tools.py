@@ -1,76 +1,139 @@
-"""EtherNet/IP MCP tool implementations."""
+"""EtherNet/IP MCP tool definitions.
+
+Every tool returns the IndustriConnect envelope ``{success, data, error, meta}``.
+Device errors and bad arguments come back as ``success: false``; nothing here
+reports success for an operation the device did not confirm.
+"""
 
 from __future__ import annotations
 
 import json
+import math
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any
 
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+from pydantic import Field, StrictInt
 
-from .eip_client import EIPClient
+from .eip_client import EIPClient, EIPClientError, parse_bool
+
+TagName = Annotated[
+    str,
+    Field(
+        min_length=1,
+        description="Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. "
+        "Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+    ),
+]
+# StrictInt: true, "2" and 2.0 are refused; booleans are never counts.
+ElementCount = Annotated[
+    StrictInt, Field(ge=1, description="Number of consecutive array elements, starting at the tag's index.")
+]
+Alias = Annotated[str, Field(min_length=1, description="Alias defined in the TAG_MAP_FILE tag map.")]
+DataType = Annotated[str, Field(min_length=1, description="Expected Logix data type, e.g. REAL, DINT, BOOL, STRING.")]
+
+_INTEGER_TYPES = {"SINT", "INT", "DINT", "LINT", "USINT", "UINT", "UDINT", "ULINT"}
+
+# Tools that change the device. Their refusals carry outcome/request_sent too.
+WRITE_TOOLS = frozenset(
+    {"write_tag", "write_array", "write_string", "write_multiple_tags", "write_tag_by_alias", "set_plc_time"}
+)
+NOT_SENT: dict[str, Any] = {"outcome": "not_sent", "request_sent": False}
+
+# Tool annotations (suite rule 13): nothing that changes the device may
+# advertise idempotency, so clients do not retry a write on their own.
+WRITE_ANNOTATIONS = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
+DEVICE_READ_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+LOCAL_READ_ANNOTATIONS = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
+LOCAL_TOOLS = frozenset({"list_tags", "get_connection_status"})
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
+def annotations_for(name: str) -> ToolAnnotations:
+    if name in WRITE_TOOLS:
+        return WRITE_ANNOTATIONS
+    return LOCAL_READ_ANNOTATIONS if name in LOCAL_TOOLS else DEVICE_READ_ANNOTATIONS
+
+
+def envelope(
+    success: bool, data: Any = None, error: str | None = None, meta: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Build the shared ``{success, data, error, meta}`` response."""
+    return {"success": success, "data": data, "error": error, "meta": dict(meta or {})}
+
+
+def ok(data: Any = None, meta: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return envelope(True, data=data, meta=meta)
+
+
+def fail(message: str, meta: Mapping[str, Any] | None = None, data: Any = None) -> dict[str, Any]:
+    return envelope(False, data=data, error=message, meta=meta)
 
 
 @dataclass(slots=True)
 class ToolConfig:
-    writes_enabled: bool = True
+    """Tool gates. Writes and system commands are off unless enabled."""
+
+    writes_enabled: bool = False
     system_cmds_enabled: bool = False
-    tag_map_path: Optional[Path] = None
+    tag_map_path: Path | None = None
 
     @classmethod
-    def from_env(cls) -> "ToolConfig":
-        tag_path = os.getenv("TAG_MAP_FILE")
+    def from_env(cls, environ: Mapping[str, str] | None = None) -> ToolConfig:
+        env = os.environ if environ is None else environ
+        tag_path = (env.get("TAG_MAP_FILE") or "").strip()
         return cls(
-            writes_enabled=_env_bool("ENIP_WRITES_ENABLED", True),
-            system_cmds_enabled=_env_bool("ENIP_SYSTEM_CMDS_ENABLED", False),
+            writes_enabled=parse_bool(env, "ENIP_WRITES_ENABLED", False),
+            system_cmds_enabled=parse_bool(env, "ENIP_SYSTEM_CMDS_ENABLED", False),
             tag_map_path=Path(tag_path).expanduser() if tag_path else None,
         )
 
 
 class TagMap:
-    def __init__(self, path: Optional[Path]) -> None:
+    """Aliases loaded from ``TAG_MAP_FILE``; reloaded when the file changes."""
+
+    def __init__(self, path: Path | None) -> None:
         self.path = path
-        self._tags: Dict[str, Dict[str, Any]] = {}
-        self._mtime: Optional[float] = None
+        self.error: str | None = None
+        self._tags: dict[str, dict[str, Any]] = {}
+        self._stamp: tuple[int, int] | None = None
         self.refresh()
 
     def refresh(self) -> None:
         if not self.path:
-            self._tags = {}
-            self._mtime = None
+            self._tags, self._stamp, self.error = {}, None, None
             return
         try:
             stat = self.path.stat()
-        except FileNotFoundError:
-            self._tags = {}
-            self._mtime = None
+        except OSError as exc:
+            self._tags, self._stamp = {}, None
+            self.error = f"TAG_MAP_FILE {self.path} cannot be read: {exc.strerror or exc}"
             return
-        if self._mtime and stat.st_mtime <= self._mtime:
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if stamp == self._stamp:
             return
+        self._stamp = stamp
         try:
-            with self.path.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-                if isinstance(data, dict):
-                    self._tags = {str(name): spec for name, spec in data.items()}
-                    self._mtime = stat.st_mtime
-        except Exception:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
             self._tags = {}
-            self._mtime = stat.st_mtime
+            self.error = f"TAG_MAP_FILE {self.path} is not valid JSON: {exc}"
+            return
+        if not isinstance(data, dict) or not all(isinstance(spec, dict) for spec in data.values()):
+            self._tags = {}
+            self.error = f"TAG_MAP_FILE {self.path} must be a JSON object mapping each alias to an object"
+            return
+        self._tags = {str(alias): spec for alias, spec in data.items()}
+        self.error = None
 
-    def get(self, name: str) -> Optional[Dict[str, Any]]:
+    def get(self, alias: str) -> dict[str, Any] | None:
         self.refresh()
-        return self._tags.get(name)
+        return self._tags.get(alias)
 
-    def list(self) -> List[Dict[str, Any]]:
+    def list(self) -> list[dict[str, Any]]:
         self.refresh()
         return [
             {
@@ -78,6 +141,7 @@ class TagMap:
                 "tag": spec.get("tag"),
                 "data_type": spec.get("data_type"),
                 "description": spec.get("description"),
+                "scaling": spec.get("scaling"),
             }
             for alias, spec in self._tags.items()
         ]
@@ -94,237 +158,400 @@ class ToolResources:
     tag_map: TagMap | None = None
 
 
+def _scaling(spec: Mapping[str, Any]) -> tuple[float, float, float, float] | None:
+    scaling = spec.get("scaling")
+    if not scaling:
+        return None
+    if not isinstance(scaling, Mapping):
+        raise ValueError("'scaling' must be an object")
+    if any(isinstance(v, bool) for v in scaling.values()):
+        raise ValueError("'scaling' values must be numbers, not booleans")
+    try:
+        raw_min = float(scaling.get("raw_min", 0))
+        raw_max = float(scaling.get("raw_max", 1))
+        eng_min = float(scaling.get("eng_min", raw_min))
+        eng_max = float(scaling.get("eng_max", raw_max))
+    except (TypeError, ValueError):
+        raise ValueError("'scaling' values must be numbers") from None
+    if not all(math.isfinite(v) for v in (raw_min, raw_max, eng_min, eng_max)):
+        raise ValueError("'scaling' values must be finite numbers")
+    if raw_max == raw_min or eng_max == eng_min:
+        raise ValueError("'scaling' has a zero span (raw_min == raw_max or eng_min == eng_max)")
+    return raw_min, raw_max, eng_min, eng_max
+
+
+def _scale(value: Any, scaling: tuple[float, float, float, float] | None, to_engineering: bool) -> Any:
+    if scaling is None:
+        return value
+    if isinstance(value, list):
+        return [_scale(item, scaling, to_engineering) for item in value]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"cannot scale the non-numeric value {value!r}")
+    raw_min, raw_max, eng_min, eng_max = scaling
+    if to_engineering:
+        return eng_min + (value - raw_min) / (raw_max - raw_min) * (eng_max - eng_min)
+    return raw_min + (value - eng_min) / (eng_max - eng_min) * (raw_max - raw_min)
+
+
+def _round_for_type(value: Any, data_type: Any) -> Any:
+    if not isinstance(data_type, str) or data_type.split("[", 1)[0].strip().upper() not in _INTEGER_TYPES:
+        return value
+    if isinstance(value, list):
+        return [_round_for_type(item, data_type) for item in value]
+    if isinstance(value, float):
+        return int(round(value))
+    return value
+
+
+def _error_meta(exc: Exception, **extra: Any) -> dict[str, Any]:
+    return {**getattr(exc, "meta", {}), **extra}
+
+
 def register_tools(server: FastMCP, resources: ToolResources) -> None:
-    tag_map = resources.tag_map or TagMap(resources.config.tag_map_path)
+    client = resources.client
+    config = resources.config
+    tag_map = resources.tag_map or TagMap(config.tag_map_path)
 
-    def _client(ctx: Context) -> EIPClient:
-        return ctx.request_context.lifespan_context.client
-
-    def _result(success: bool, data: Any = None, error: Optional[str] = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return {"success": success, "data": data, "error": error, "meta": meta or {}}
-
-    def _ok(data: Any = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return _result(True, data=data, meta=meta)
-
-    def _err(message: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        return _result(False, error=message, meta=meta)
-
-    def _ensure_writes_allowed(tool: str) -> Optional[Dict[str, Any]]:
-        if not resources.config.writes_enabled:
-            return _err("Write operations are disabled by configuration", {"tool": tool})
+    def writes_refused(tool: str) -> dict[str, Any] | None:
+        if not config.writes_enabled:
+            return fail(
+                "Write operations are disabled (set ENIP_WRITES_ENABLED=true to allow them)", {"tool": tool, **NOT_SENT}
+            )
         return None
 
-    def _ensure_system(tool: str) -> Optional[Dict[str, Any]]:
-        if not resources.config.system_cmds_enabled:
-            return _err("System commands are disabled (set ENIP_SYSTEM_CMDS_ENABLED=true)", {"tool": tool})
+    def system_refused(tool: str) -> dict[str, Any] | None:
+        # System commands change the controller, so they need both gates.
+        missing = [
+            name
+            for name, enabled in (
+                ("ENIP_WRITES_ENABLED", config.writes_enabled),
+                ("ENIP_SYSTEM_CMDS_ENABLED", config.system_cmds_enabled),
+            )
+            if not enabled
+        ]
+        if missing:
+            return fail(
+                f"{tool} changes the controller and is disabled: it needs ENIP_WRITES_ENABLED=true and "
+                f"ENIP_SYSTEM_CMDS_ENABLED=true (not set: {', '.join(missing)})",
+                {"tool": tool, **NOT_SENT},
+            )
         return None
 
-    def _normalize_tag_result(result: Any) -> Any:
-        if isinstance(result, list):
-            return [_normalize_tag_result(item) for item in result]
-        if hasattr(result, "value"):
-            return {
-                "tag": getattr(result, "tag", None),
-                "value": getattr(result, "value", None),
-                "data_type": getattr(result, "type", None),
-                "status": getattr(result, "status", None),
-                "error": getattr(result, "error", None),
-            }
-        if isinstance(result, dict) and "value" in result:
-            return {
-                "tag": result.get("tag"),
-                "value": result.get("value"),
-                "data_type": result.get("type") or result.get("data_type"),
-                "status": result.get("status"),
-                "error": result.get("error"),
-            }
-        return result
+    def alias_spec(alias: str, tool: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        spec = tag_map.get(alias.strip())
+        if tag_map.error:
+            return None, fail(tag_map.error, {"tool": tool, "alias": alias})
+        if spec is None:
+            known = "none defined" if tag_map.path is None else f"{tag_map.count()} defined"
+            return None, fail(f"Unknown alias '{alias}' ({known}; see list_tags)", {"tool": tool, "alias": alias})
+        tag = spec.get("tag")
+        if not isinstance(tag, str) or not tag.strip():
+            return None, fail(f"Alias '{alias}' has no 'tag' field in the tag map", {"tool": tool, "alias": alias})
+        data_type = spec.get("data_type")
+        if data_type is not None and (not isinstance(data_type, str) or not data_type.strip()):
+            return None, fail(
+                f"Alias '{alias}' has an invalid 'data_type' in the tag map (expected a type name such as REAL)",
+                {"tool": tool, "alias": alias},
+            )
+        return spec, None
 
-    def _apply_scaling(value: Any, spec: Dict[str, Any], direction: str) -> Any:
-        scaling = spec.get("scaling")
-        if not scaling:
-            return value
-
-        def _transform_scalar(val: Any) -> Any:
-            try:
-                val = float(val)
-            except (TypeError, ValueError):
-                return val
-            raw_min = float(scaling.get("raw_min", 0))
-            raw_max = float(scaling.get("raw_max", 1))
-            eng_min = float(scaling.get("eng_min", raw_min))
-            eng_max = float(scaling.get("eng_max", raw_max))
-            if direction == "to_eng":
-                span = raw_max - raw_min or 1.0
-                ratio = (val - raw_min) / span
-                return eng_min + ratio * (eng_max - eng_min)
-            span = eng_max - eng_min or 1.0
-            ratio = (val - eng_min) / span
-            return raw_min + ratio * (raw_max - raw_min)
-
-        if isinstance(value, list):
-            return [_transform_scalar(v) for v in value]
-        return _transform_scalar(value)
-
-    @server.tool()
-    async def read_tag(tag_name: str, ctx: Context, count: Optional[int] = None) -> Dict[str, Any]:
+    async def do_read(tool: str, tag_name: str, count: int | None) -> dict[str, Any]:
         try:
-            result, meta = await _client(ctx).read_tag(tag_name, count)
-        except Exception as exc:
-            return _err(str(exc), {"tag_name": tag_name})
-        return _ok(
-            data={"tag": tag_name, "result": _normalize_tag_result(result)},
-            meta={**meta, "tag_name": tag_name},
-        )
+            result, meta = await client.read_tag(tag_name, count)
+        except (EIPClientError, ValueError) as exc:
+            return fail(str(exc), _error_meta(exc, tool=tool, tag_name=tag_name))
+        return ok(result, {**meta, "tool": tool, "tag_name": tag_name})
 
-    @server.tool()
-    async def write_tag(tag_name: str, value: Any, ctx: Context, data_type: Optional[str] = None) -> Dict[str, Any]:
-        guard = _ensure_writes_allowed("write_tag")
-        if guard:
-            return guard
+    async def do_write(tool: str, tag_name: str, value: Any, data_type: str | None) -> dict[str, Any]:
+        refused = writes_refused(tool)
+        if refused:
+            return refused
         try:
-            meta = await _client(ctx).write_tag(tag_name, value, data_type)
-        except Exception as exc:
-            return _err(str(exc), {"tag_name": tag_name})
-        return _ok(data={"tag": tag_name, "written": value}, meta={**meta, "tag_name": tag_name})
+            result, meta = await client.write_tag(tag_name, value, data_type)
+        except ValueError as exc:  # bad input, found before anything was sent
+            return fail(str(exc), {"tool": tool, "tag_name": tag_name, **NOT_SENT})
+        except EIPClientError as exc:  # meta carries outcome and request_sent
+            return fail(str(exc), _error_meta(exc, tool=tool, tag_name=tag_name))
+        return ok(result, {**meta, "tool": tool, "tag_name": tag_name})
 
-    @server.tool()
-    async def read_array(tag_name: str, elements: int, ctx: Context) -> Dict[str, Any]:
-        return await read_tag(tag_name, ctx, count=elements)
+    @server.tool(annotations=annotations_for("read_tag"))
+    async def read_tag(tag_name: TagName, count: ElementCount | None = None) -> dict[str, Any]:
+        """Read one tag from the controller.
 
-    @server.tool()
-    async def write_array(tag_name: str, values: List[Any], ctx: Context) -> Dict[str, Any]:
-        return await write_tag(tag_name, values, ctx)
+        Returns data {tag, value, data_type}. With `count`, reads that many array
+        elements and returns them as a list (same as read_array). Fails with
+        success=false if the controller rejects the tag.
+        """
+        return await do_read("read_tag", tag_name, count)
 
-    @server.tool()
-    async def read_string(tag_name: str, ctx: Context) -> Dict[str, Any]:
-        response = await read_tag(tag_name, ctx)
-        if response["success"]:
-            payload = response["data"]["result"]
-            if isinstance(payload, dict) and "value" in payload:
-                payload["value"] = str(payload["value"])
+    @server.tool(annotations=annotations_for("write_tag"))
+    async def write_tag(tag_name: TagName, value: Any, data_type: DataType | None = None) -> dict[str, Any]:
+        """Write one tag on the controller. Refused unless ENIP_WRITES_ENABLED=true.
+
+        Sent at most once: if the reply is lost, the result is success=false
+        with meta.outcome='unknown' (the write may have been applied; read the
+        tag back before writing again).
+
+        `value` is a number, boolean, string, list (written to consecutive array
+        elements) or object (structure members). On a real controller pycomm3
+        encodes the value with the controller's own type for the tag, so
+        `data_type` is only checked: the mock rejects a mismatch, and over CIP a
+        mismatch is reported in meta.warning. Writes change a running process.
+        """
+        return await do_write("write_tag", tag_name, value, data_type)
+
+    @server.tool(annotations=annotations_for("read_array"))
+    async def read_array(tag_name: TagName, elements: ElementCount) -> dict[str, Any]:
+        """Read `elements` consecutive elements of an array tag as a list.
+
+        Starts at element 0, or at the index in the tag name (e.g. 'Tank_Levels[1]').
+        """
+        return await do_read("read_array", tag_name, elements)
+
+    @server.tool(annotations=annotations_for("write_array"))
+    async def write_array(tag_name: TagName, values: Annotated[list[Any], Field(min_length=1)]) -> dict[str, Any]:
+        """Write a list of values to consecutive array elements. Refused unless ENIP_WRITES_ENABLED=true.
+
+        Writes len(values) elements starting at element 0, or at the index in
+        the tag name (e.g. 'Tank_Levels[1]').
+        """
+        return await do_write("write_array", tag_name, values, None)
+
+    @server.tool(annotations=annotations_for("read_string"))
+    async def read_string(tag_name: TagName) -> dict[str, Any]:
+        """Read a STRING tag. Fails with success=false if the tag does not hold a string."""
+        response = await do_read("read_string", tag_name, None)
+        if response["success"] and not isinstance(response["data"]["value"], str):
+            data = response["data"]
+            return fail(
+                f"Tag '{data['tag']}' is not a string (data_type {data.get('data_type')}); use read_tag",
+                {**response["meta"]},
+            )
         return response
 
-    @server.tool()
-    async def write_string(tag_name: str, value: str, ctx: Context) -> Dict[str, Any]:
-        return await write_tag(tag_name, value, ctx)
+    @server.tool(annotations=annotations_for("write_string"))
+    async def write_string(tag_name: TagName, value: str) -> dict[str, Any]:
+        """Write text to a STRING tag. Refused unless ENIP_WRITES_ENABLED=true."""
+        return await do_write("write_string", tag_name, value, None)
 
-    @server.tool()
-    async def get_tag_list(ctx: Context, program: Optional[str] = None) -> Dict[str, Any]:
+    @server.tool(annotations=annotations_for("get_tag_list"))
+    async def get_tag_list(
+        program: Annotated[
+            str,
+            Field(
+                min_length=1,
+                description="Omit for controller-scoped tags, '*' for every tag including program tags, "
+                "or a program name such as 'MainProgram'.",
+            ),
+        ]
+        | None = None,
+    ) -> dict[str, Any]:
+        """List tag definitions (name and data type) uploaded from the controller.
+
+        Scope follows pycomm3: no `program` lists controller-scoped tags, '*'
+        lists all tags, and a program name lists that program's tags (named
+        'Program:<name>.<tag>').
+        """
         try:
-            result, meta = await _client(ctx).get_tag_list(program)
-        except Exception as exc:
-            return _err(str(exc), {"program": program})
-        return _ok(data={"program": program, "tags": result}, meta=meta)
+            tags, meta = await client.get_tag_list(program)
+        except (EIPClientError, ValueError) as exc:
+            return fail(str(exc), _error_meta(exc, tool="get_tag_list", program=program))
+        return ok({"program": program, "tags": tags}, meta)
 
-    @server.tool()
-    async def read_multiple_tags(tags: List[str], ctx: Context) -> Dict[str, Any]:
+    @server.tool(annotations=annotations_for("read_multiple_tags"))
+    async def read_multiple_tags(
+        tags: Annotated[list[Annotated[str, Field(min_length=1)]], Field(min_length=1)],
+    ) -> dict[str, Any]:
+        """Read several tags in one call.
+
+        data.results has one {tag, value, data_type, error} entry per tag, in
+        order. success is true only if every read succeeded.
+        """
         try:
-            result, meta = await _client(ctx).read_multiple_tags(tags)
-        except Exception as exc:
-            return _err(str(exc), {"tags": tags})
-        return _ok(data={"results": _normalize_tag_result(result)}, meta={**meta, "count": len(tags)})
+            results, meta = await client.read_multiple_tags(tags)
+        except (EIPClientError, ValueError) as exc:
+            return fail(str(exc), _error_meta(exc, tool="read_multiple_tags", tags=tags))
+        meta = {**meta, "count": len(results)}
+        failed = [r for r in results if r["error"]]
+        if failed:
+            detail = "; ".join(f"{r['tag']}: {r['error']}" for r in failed)
+            return fail(f"{len(failed)} of {len(results)} reads failed: {detail}", meta, {"results": results})
+        return ok({"results": results}, meta)
 
-    @server.tool()
-    async def write_multiple_tags(payloads: List[Dict[str, Any]], ctx: Context) -> Dict[str, Any]:
-        guard = _ensure_writes_allowed("write_multiple_tags")
-        if guard:
-            return guard
-        values = {}
-        dtypes = {}
-        for item in payloads:
-            tag = item.get("tag_name") or item.get("tag")
-            if not tag:
-                return _err("Each payload requires tag/tag_name")
-            values[tag] = item.get("value")
-            if item.get("data_type"):
-                dtypes[tag] = item["data_type"]
+    @server.tool(annotations=annotations_for("write_multiple_tags"))
+    async def write_multiple_tags(
+        payloads: Annotated[
+            list[dict[str, Any]],
+            Field(
+                min_length=1,
+                description="Entries of the form {'tag_name': ..., 'value': ..., 'data_type': optional}.",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        """Write several tags in one call. Refused unless ENIP_WRITES_ENABLED=true.
+
+        data.results always has one {tag, value, data_type, error, outcome,
+        request_sent} entry per payload. outcome is 'written', 'rejected' (the
+        device refused it), 'unknown' (it may have been applied but was not
+        confirmed; read it back) or 'not_sent'. success is true only if every
+        entry was written. The writes are not atomic and are never re-sent.
+        """
+        refused = writes_refused("write_multiple_tags")
+        if refused:
+            return refused
+        items: list[tuple[str, Any, str | None]] = []
+        seen: set[str] = set()
+        for index, item in enumerate(payloads):
+            tag = item.get("tag_name", item.get("tag"))
+            if not isinstance(tag, str) or not tag.strip():
+                return fail(
+                    f"payloads[{index}] needs a non-empty 'tag_name'", {"tool": "write_multiple_tags", **NOT_SENT}
+                )
+            if item.get("value") is None:
+                return fail(f"payloads[{index}] ({tag}) needs a 'value'", {"tool": "write_multiple_tags", **NOT_SENT})
+            if tag.strip() in seen:
+                return fail(f"payloads lists '{tag}' more than once", {"tool": "write_multiple_tags", **NOT_SENT})
+            data_type = item.get("data_type")
+            if data_type is not None and (not isinstance(data_type, str) or not data_type.strip()):
+                return fail(
+                    f"payloads[{index}] ({tag}) has an invalid 'data_type'", {"tool": "write_multiple_tags", **NOT_SENT}
+                )
+            seen.add(tag.strip())
+            items.append((tag.strip(), item["value"], data_type))
         try:
-            meta = await _client(ctx).write_multiple_tags({k: v for k, v in values.items()})
-        except Exception as exc:
-            return _err(str(exc))
-        return _ok(
-            data={"written": [{"tag": tag, "value": values[tag], "data_type": dtypes.get(tag)} for tag in values]},
-            meta={**meta, "count": len(values)},
-        )
+            results, meta = await client.write_multiple_tags(items)
+        except ValueError as exc:  # bad input, found before anything was sent
+            return fail(str(exc), {"tool": "write_multiple_tags", **NOT_SENT})
+        meta = {**meta, "count": len(results)}
+        failed = [r for r in results if r["outcome"] != "written"]
+        if failed:
+            detail = "; ".join(f"{r['tag']} ({r['outcome']}): {r['error']}" for r in failed)
+            return fail(
+                f"{len(failed)} of {len(results)} writes were not confirmed: {detail}", meta, {"results": results}
+            )
+        return ok({"results": results}, meta)
 
-    @server.tool()
-    async def list_tags(ctx: Context) -> Dict[str, Any]:  # noqa: ARG001 - ctx required by signature
-        return _ok(data={"aliases": tag_map.list(), "count": tag_map.count()})
+    @server.tool(annotations=annotations_for("list_tags"))
+    async def list_tags() -> dict[str, Any]:
+        """List the aliases defined in the TAG_MAP_FILE tag map, with their tags and scaling."""
+        aliases = tag_map.list()
+        if tag_map.error:
+            return fail(tag_map.error, {"tool": "list_tags"})
+        meta = {"tag_map_file": str(tag_map.path) if tag_map.path else None}
+        return ok({"aliases": aliases, "count": len(aliases)}, meta)
 
-    @server.tool()
-    async def read_tag_by_alias(alias: str, ctx: Context) -> Dict[str, Any]:
-        spec = tag_map.get(alias)
-        if not spec:
-            return _err(f"Unknown alias '{alias}'")
-        tag_name = spec.get("tag")
-        if not tag_name:
-            return _err(f"Alias '{alias}' is missing 'tag' field")
-        response = await read_tag(tag_name, ctx)
-        if response["success"]:
-            result = response["data"]["result"]
-            value = result.get("value") if isinstance(result, dict) else result
-            scaled = _apply_scaling(value, spec, "to_eng")
-            if isinstance(result, dict):
-                result["value"] = scaled
-            else:
-                response["data"]["result"] = scaled
-            response["data"]["alias"] = alias
-        return response
+    @server.tool(annotations=annotations_for("read_tag_by_alias"))
+    async def read_tag_by_alias(alias: Alias) -> dict[str, Any]:
+        """Read the tag behind a tag-map alias, converted to engineering units if the alias defines scaling.
 
-    @server.tool()
-    async def write_tag_by_alias(alias: str, value: Any, ctx: Context) -> Dict[str, Any]:
-        guard = _ensure_writes_allowed("write_tag_by_alias")
-        if guard:
-            return guard
-        spec = tag_map.get(alias)
-        if not spec:
-            return _err(f"Unknown alias '{alias}'")
-        tag_name = spec.get("tag")
-        if not tag_name:
-            return _err(f"Alias '{alias}' is missing 'tag' field")
-        scaled = _apply_scaling(value, spec, "to_raw")
-        return await write_tag(tag_name, scaled, ctx, data_type=spec.get("data_type"))
+        data.raw_value is the controller value, data.value the scaled one.
+        """
+        spec, error = alias_spec(alias, "read_tag_by_alias")
+        if error:
+            return error
+        response = await do_read("read_tag_by_alias", spec["tag"], None)
+        if not response["success"]:
+            return response
+        data = response["data"]
+        try:
+            scaled = _scale(data["value"], _scaling(spec), to_engineering=True)
+        except ValueError as exc:
+            return fail(f"Alias '{alias}': {exc}", response["meta"])
+        return ok({**data, "alias": alias, "raw_value": data["value"], "value": scaled}, response["meta"])
 
-    @server.tool()
-    async def ping(ctx: Context) -> Dict[str, Any]:
-        client = _client(ctx)
-        return _ok(
-            data={
+    @server.tool(annotations=annotations_for("write_tag_by_alias"))
+    async def write_tag_by_alias(alias: Alias, value: Any) -> dict[str, Any]:
+        """Write the tag behind a tag-map alias. Refused unless ENIP_WRITES_ENABLED=true.
+
+        `value` is in engineering units if the alias defines scaling; it is then
+        converted to raw units, rounded for integer data types, before writing.
+        """
+        refused = writes_refused("write_tag_by_alias")
+        if refused:
+            return refused
+        spec, error = alias_spec(alias, "write_tag_by_alias")
+        if error:
+            error["meta"].update(NOT_SENT)
+            return error
+        try:
+            scaling = _scaling(spec)
+            raw = _scale(value, scaling, to_engineering=False)
+            if scaling is not None:
+                raw = _round_for_type(raw, spec.get("data_type"))
+        except ValueError as exc:
+            return fail(f"Alias '{alias}': {exc}", {"tool": "write_tag_by_alias", "alias": alias, **NOT_SENT})
+        response = await do_write("write_tag_by_alias", spec["tag"], raw, spec.get("data_type"))
+        if not response["success"]:
+            return response
+        return ok({**response["data"], "alias": alias, "raw_value": raw, "value": value}, response["meta"])
+
+    @server.tool(annotations=annotations_for("ping"))
+    async def ping() -> dict[str, Any]:
+        """Check that the controller (or mock) answers, by requesting its identity.
+
+        Fails with success=false if it does not answer. Also reports the write
+        and system-command gates.
+        """
+        try:
+            info, meta = await client.ping()
+        except EIPClientError as exc:
+            return fail(str(exc), _error_meta(exc, tool="ping", connection=client.connection_status()))
+        return ok(
+            {
+                "reachable": True,
+                "latency_ms": meta.get("duration_ms"),
+                "product_name": info.get("product_name"),
                 "connection": client.connection_status(),
-                "writes_enabled": resources.config.writes_enabled,
-                "system_cmds_enabled": resources.config.system_cmds_enabled,
+                "writes_enabled": config.writes_enabled,
+                "system_cmds_enabled": config.system_cmds_enabled,
                 "tag_aliases": tag_map.count(),
-            }
+            },
+            meta,
         )
 
-    @server.tool()
-    async def get_connection_status(ctx: Context) -> Dict[str, Any]:
-        return _ok(data=_client(ctx).connection_status())
+    @server.tool(annotations=annotations_for("get_connection_status"))
+    async def get_connection_status() -> dict[str, Any]:
+        """Report the configured target and the outcome of the last exchange, without contacting the device.
 
-    @server.tool()
-    async def get_plc_info(ctx: Context) -> Dict[str, Any]:
-        try:
-            info, meta = await _client(ctx).get_controller_info()
-        except Exception as exc:
-            return _err(str(exc))
-        return _ok(data=info, meta=meta)
+        Use ping to test the device now.
+        """
+        return ok(client.connection_status())
 
-    @server.tool()
-    async def get_plc_time(ctx: Context) -> Dict[str, Any]:
+    @server.tool(annotations=annotations_for("get_plc_info"))
+    async def get_plc_info() -> dict[str, Any]:
+        """Read the controller identity: name, vendor, product, revision (firmware), serial and keyswitch."""
         try:
-            timestamp, meta = await _client(ctx).get_plc_time()
-        except Exception as exc:
-            return _err(str(exc))
-        return _ok(data={"plc_time": timestamp}, meta=meta)
+            info, meta = await client.get_controller_info()
+        except EIPClientError as exc:
+            return fail(str(exc), _error_meta(exc, tool="get_plc_info"))
+        return ok(info, meta)
 
-    @server.tool()
-    async def set_plc_time(ctx: Context) -> Dict[str, Any]:
-        guard = _ensure_system("set_plc_time")
-        if guard:
-            return guard
+    @server.tool(annotations=annotations_for("get_plc_time"))
+    async def get_plc_time() -> dict[str, Any]:
+        """Read the controller's wall clock.
+
+        data.plc_time is ISO 8601 without a time zone, as the controller reports
+        it; data.microseconds is the raw value (µs since 1970-01-01).
+        """
         try:
-            meta = await _client(ctx).set_plc_time()
-        except Exception as exc:
-            return _err(str(exc))
-        return _ok(data={"updated": True}, meta=meta)
+            payload, meta = await client.get_plc_time()
+        except EIPClientError as exc:
+            return fail(str(exc), _error_meta(exc, tool="get_plc_time"))
+        return ok(payload, meta)
+
+    @server.tool(annotations=annotations_for("set_plc_time"))
+    async def set_plc_time() -> dict[str, Any]:
+        """Set the controller's wall clock to this host's current time.
+
+        Refused unless both ENIP_WRITES_ENABLED=true and ENIP_SYSTEM_CMDS_ENABLED=true.
+        Not retried once sent: if the reply is lost, the error says the clock
+        may have been set.
+        """
+        refused = system_refused("set_plc_time")
+        if refused:
+            return refused
+        try:
+            payload, meta = await client.set_plc_time()
+        except EIPClientError as exc:
+            return fail(str(exc), _error_meta(exc, tool="set_plc_time"))
+        return ok({"updated": True, **payload}, meta)

@@ -23,11 +23,12 @@
 ## Checklist
 
 - [ ] Tools still return the shared `{ success, data, error, meta }` envelope.
-- [ ] The mock PLC can exercise the change, and I tested against it.
+- [ ] The mock PLC can exercise the change, and I added or updated tests in `ethernetip-python/tests`.
+- [ ] Write tools stay off by default (`ENIP_WRITES_ENABLED` unset means read-only).
 - [ ] If the change touches the `pycomm3` path to real controllers, I described the bench I tested it on.
 - [ ] Nothing was tested against production equipment.
 - [ ] `stdout` is still clean: all logging goes to `stderr`.
-- [ ] The CI checks pass locally (see [CONTRIBUTING.md](https://github.com/IndustriAgents/EtherNetIP-MCP/blob/main/CONTRIBUTING.md#testing-a-change)), and `uv.lock` is updated if dependencies changed.
+- [ ] The CI checks pass locally, including `pytest` and `ruff` (see [CONTRIBUTING.md](https://github.com/IndustriAgents/EtherNetIP-MCP/blob/main/CONTRIBUTING.md#testing-a-change)), and `uv.lock` is updated if dependencies changed.
 - [ ] I updated the README where relevant.
 
 ## How to test

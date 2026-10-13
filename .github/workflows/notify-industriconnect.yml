@@ -1,7 +1,7 @@
 name: Notify IndustriConnect
 
-# Tells IndustriAgents/IndustriConnect that main moved, so it can bump its
-# EtherNetIP-Project submodule pointer without waiting for its nightly cron.
+# Tells IndustriAgents/IndustriConnect that main moved, so IndustriConnect can
+# bump its EtherNetIP-Project submodule pointer.
 on:
   push:
     branches: [main]
