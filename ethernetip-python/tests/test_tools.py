@@ -20,23 +20,14 @@ from ethernetip_mcp.server import EtherNetIPMCPServer
 from ethernetip_mcp.tools import ToolConfig
 
 EXPECTED_TOOLS = {
-    "read_tag",
-    "write_tag",
-    "read_array",
-    "write_array",
-    "read_string",
-    "write_string",
     "get_tag_list",
-    "read_multiple_tags",
-    "write_multiple_tags",
-    "list_tags",
-    "read_tag_by_alias",
-    "write_tag_by_alias",
-    "ping",
     "get_connection_status",
-    "get_plc_info",
-    "get_plc_time",
     "set_plc_time",
+    "get_plc_info",
+    "list_tags",
+    "write_tags",
+    "get_plc_time",
+    "read_tags",
 }
 
 TAG_MAP = {
@@ -79,7 +70,7 @@ async def session(
 
 async def call(client_session: ClientSession, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     result = await client_session.call_tool(name, arguments or {})
-    assert not result.isError, result.content
+    assert result.isError is (json.loads(result.content[0].text).get("success") is False), result.content
     envelope = result.structuredContent
     assert set(envelope) == {"success", "data", "error", "meta"}
     assert json.loads(result.content[0].text) == envelope
@@ -107,7 +98,7 @@ async def test_server_reports_its_own_version() -> None:
     server = EtherNetIPMCPServer(client=client, tool_config=ToolConfig())
     options = server.mcp._mcp_server.create_initialization_options()
     assert options.server_name == "EtherNet/IP MCP Server"
-    assert options.server_version == package_version() == importlib.metadata.version("ethernetip-mcp")
+    assert options.server_version == package_version() == importlib.metadata.version("industriagents-ethernetip-mcp")
 
 
 @pytest.mark.parametrize(
@@ -494,7 +485,7 @@ async def test_tool_annotations_never_invite_retries() -> None:
     for name, tool in tools.items():
         hints = tool.annotations
         assert hints is not None, name
-        if name in WRITE_TOOLS:
+        if name in {"write_tags", "set_plc_time"}:
             assert hints.readOnlyHint is False, name
             assert hints.destructiveHint is True, name
             assert hints.idempotentHint is False, name
@@ -502,4 +493,4 @@ async def test_tool_annotations_never_invite_retries() -> None:
             assert hints.readOnlyHint is True, name
             assert hints.idempotentHint is not False or hints.readOnlyHint, name
     assert tools["list_tags"].annotations.openWorldHint is False
-    assert tools["read_tag"].annotations.openWorldHint is True
+    assert tools["read_tags"].annotations.openWorldHint is True

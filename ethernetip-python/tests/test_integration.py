@@ -54,7 +54,7 @@ async def mcp_session(env: dict[str, str], errlog: Path) -> AsyncIterator[tuple[
 
 async def call(session: ClientSession, name: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     result = await session.call_tool(name, arguments or {})
-    assert not result.isError, result.content
+    assert result.isError is (json.loads(result.content[0].text).get("success") is False), result.content
     envelope = json.loads(result.content[0].text)
     assert set(envelope) == {"success", "data", "error", "meta"}
     return envelope
@@ -89,7 +89,7 @@ async def test_full_session_against_the_mock(mock_plc: MockPLC, tmp_path: Path) 
         assert init.serverInfo.version == package_version()
 
         tools = (await s.list_tools()).tools
-        assert len(tools) == 17 and all(t.description for t in tools)
+        assert len(tools) == 8 and all(t.description for t in tools)
 
         status = await call(s, "get_connection_status")
         assert status["data"]["connected"] is False  # nothing exchanged yet

@@ -1,0 +1,988 @@
+{
+  "schemaVersion": 1,
+  "protocol": "ethernetip",
+  "transport": "stdio",
+  "tools": [
+    {
+      "name": "read_tags",
+      "description": "Select one target mode and provide only its parameters.\n\ntag: Read one tag from the controller.\n\n        Returns data {tag, value, data_type}. With `count`, reads that many array\n        elements and returns them as a list (same as read_array). Fails with\n        success=false if the controller rejects the tag.\n        \n\nbatch: Read several tags in one call.\n\n        data.results has one {tag, value, data_type, error} entry per tag, in\n        order. success is true only if every read succeeded.\n        \n\nalias: Read the tag behind a tag-map alias, converted to engineering units if the alias defines scaling.\n\n        data.raw_value is the controller value, data.value the scaled one.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tag_name": {
+            "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+            "minLength": 1,
+            "title": "Tag Name",
+            "type": "string"
+          },
+          "count": {
+            "anyOf": [
+              {
+                "description": "Number of consecutive array elements, starting at the tag's index.",
+                "minimum": 1,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Count",
+            "description": "Number of consecutive array elements, starting at the tag's index."
+          },
+          "target": {
+            "anyOf": [
+              {
+                "const": "tag",
+                "type": "string"
+              },
+              {
+                "const": "batch",
+                "type": "string"
+              },
+              {
+                "const": "alias",
+                "type": "string"
+              }
+            ],
+            "description": "Select the target mode described above."
+          },
+          "tags": {
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "minItems": 1,
+            "title": "Tags",
+            "type": "array",
+            "description": "tags for the selected operation; see its mode description."
+          },
+          "alias": {
+            "description": "Alias defined in the TAG_MAP_FILE tag map.",
+            "minLength": 1,
+            "title": "Alias",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "oneOf": [
+          {
+            "properties": {
+              "tag_name": {
+                "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+                "minLength": 1,
+                "title": "Tag Name",
+                "type": "string"
+              },
+              "count": {
+                "anyOf": [
+                  {
+                    "description": "Number of consecutive array elements, starting at the tag's index.",
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Count"
+              },
+              "target": {
+                "const": "tag",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tag_name",
+              "target"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "tags": {
+                "items": {
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "minItems": 1,
+                "title": "Tags",
+                "type": "array"
+              },
+              "target": {
+                "const": "batch",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tags",
+              "target"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "alias": {
+                "description": "Alias defined in the TAG_MAP_FILE tag map.",
+                "minLength": 1,
+                "title": "Alias",
+                "type": "string"
+              },
+              "target": {
+                "const": "alias",
+                "type": "string"
+              }
+            },
+            "required": [
+              "alias",
+              "target"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "write_tags",
+      "description": "Select one target mode and provide only its parameters.\n\ntag: Write one tag on the controller. Refused unless ENIP_WRITES_ENABLED=true.\n\n        Sent at most once: if the reply is lost, the result is success=false\n        with meta.outcome='unknown' (the write may have been applied; read the\n        tag back before writing again).\n\n        `value` is a number, boolean, string, list (written to consecutive array\n        elements) or object (structure members). On a real controller pycomm3\n        encodes the value with the controller's own type for the tag, so\n        `data_type` is only checked: the mock rejects a mismatch, and over CIP a\n        mismatch is reported in meta.warning. Writes change a running process.\n        \n\nbatch: Write several tags in one call. Refused unless ENIP_WRITES_ENABLED=true.\n\n        data.results always has one {tag, value, data_type, error, outcome,\n        request_sent} entry per payload. outcome is 'written', 'rejected' (the\n        device refused it), 'unknown' (it may have been applied but was not\n        confirmed; read it back) or 'not_sent'. success is true only if every\n        entry was written. The writes are not atomic and are never re-sent.\n        \n\nalias: Write the tag behind a tag-map alias. Refused unless ENIP_WRITES_ENABLED=true.\n\n        `value` is in engineering units if the alias defines scaling; it is then\n        converted to raw units, rounded for integer data types, before writing.\n        ",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "tag_name": {
+            "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+            "minLength": 1,
+            "title": "Tag Name",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "description": "value for the selected operation; see its mode description."
+          },
+          "data_type": {
+            "anyOf": [
+              {
+                "description": "Expected Logix data type, e.g. REAL, DINT, BOOL, STRING.",
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Data Type",
+            "description": "Expected Logix data type, e.g. REAL, DINT, BOOL, STRING."
+          },
+          "target": {
+            "anyOf": [
+              {
+                "const": "tag",
+                "type": "string"
+              },
+              {
+                "const": "batch",
+                "type": "string"
+              },
+              {
+                "const": "alias",
+                "type": "string"
+              }
+            ],
+            "description": "Select the target mode described above."
+          },
+          "payloads": {
+            "description": "Entries of the form {'tag_name': ..., 'value': ..., 'data_type': optional}.",
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "minItems": 1,
+            "title": "Payloads",
+            "type": "array"
+          },
+          "alias": {
+            "description": "Alias defined in the TAG_MAP_FILE tag map.",
+            "minLength": 1,
+            "title": "Alias",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target"
+        ],
+        "oneOf": [
+          {
+            "properties": {
+              "tag_name": {
+                "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+                "minLength": 1,
+                "title": "Tag Name",
+                "type": "string"
+              },
+              "value": {
+                "title": "Value"
+              },
+              "data_type": {
+                "anyOf": [
+                  {
+                    "description": "Expected Logix data type, e.g. REAL, DINT, BOOL, STRING.",
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "default": null,
+                "title": "Data Type"
+              },
+              "target": {
+                "const": "tag",
+                "type": "string"
+              }
+            },
+            "required": [
+              "tag_name",
+              "value",
+              "target"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "payloads": {
+                "description": "Entries of the form {'tag_name': ..., 'value': ..., 'data_type': optional}.",
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "minItems": 1,
+                "title": "Payloads",
+                "type": "array"
+              },
+              "target": {
+                "const": "batch",
+                "type": "string"
+              }
+            },
+            "required": [
+              "payloads",
+              "target"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          },
+          {
+            "properties": {
+              "alias": {
+                "description": "Alias defined in the TAG_MAP_FILE tag map.",
+                "minLength": 1,
+                "title": "Alias",
+                "type": "string"
+              },
+              "value": {
+                "title": "Value"
+              },
+              "target": {
+                "const": "alias",
+                "type": "string"
+              }
+            },
+            "required": [
+              "alias",
+              "value",
+              "target"
+            ],
+            "type": "object",
+            "additionalProperties": false
+          }
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_tag_list",
+      "description": "List tag definitions (name and data type) uploaded from the controller.\n\n        Scope follows pycomm3: no `program` lists controller-scoped tags, '*'\n        lists all tags, and a program name lists that program's tags (named\n        'Program:<name>.<tag>').\n        ",
+      "inputSchema": {
+        "properties": {
+          "program": {
+            "anyOf": [
+              {
+                "description": "Omit for controller-scoped tags, '*' for every tag including program tags, or a program name such as 'MainProgram'.",
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Program",
+            "description": "Omit for controller-scoped tags, '*' for every tag including program tags, or a program name such as 'MainProgram'."
+          }
+        },
+        "title": "get_tag_listArguments",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "list_tags",
+      "description": "List the aliases defined in the TAG_MAP_FILE tag map, with their tags and scaling.",
+      "inputSchema": {
+        "properties": {},
+        "title": "list_tagsArguments",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_connection_status",
+      "description": "Report the configured target and the outcome of the last exchange, without contacting the device.\n\n        Use ping to test the device now.\n        ",
+      "inputSchema": {
+        "properties": {},
+        "title": "get_connection_statusArguments",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "get_plc_info",
+      "description": "Read the controller identity: name, vendor, product, revision (firmware), serial and keyswitch.",
+      "inputSchema": {
+        "properties": {},
+        "title": "get_plc_infoArguments",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "get_plc_time",
+      "description": "Read the controller's wall clock.\n\n        data.plc_time is ISO 8601 without a time zone, as the controller reports\n        it; data.microseconds is the raw value (\u00b5s since 1970-01-01).\n        ",
+      "inputSchema": {
+        "properties": {},
+        "title": "get_plc_timeArguments",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "set_plc_time",
+      "description": "Set the controller's wall clock to this host's current time.\n\n        Refused unless both ENIP_WRITES_ENABLED=true and ENIP_SYSTEM_CMDS_ENABLED=true.\n        Not retried once sent: if the reply is lost, the error says the clock\n        may have been set.\n        ",
+      "inputSchema": {
+        "properties": {},
+        "title": "set_plc_timeArguments",
+        "type": "object",
+        "additionalProperties": false
+      },
+      "outputSchema": {
+        "type": "object",
+        "required": [
+          "success",
+          "data",
+          "error",
+          "meta"
+        ],
+        "properties": {
+          "success": {
+            "type": "boolean"
+          },
+          "data": {},
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "meta": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    }
+  ],
+  "routes": {
+    "read_tags": {
+      "selector": "target",
+      "options": {
+        "tag": "read_tag",
+        "batch": "read_multiple_tags",
+        "alias": "read_tag_by_alias"
+      }
+    },
+    "write_tags": {
+      "selector": "target",
+      "options": {
+        "tag": "write_tag",
+        "batch": "write_multiple_tags",
+        "alias": "write_tag_by_alias"
+      }
+    },
+    "get_tag_list": {
+      "handler": "get_tag_list"
+    },
+    "list_tags": {
+      "handler": "list_tags"
+    },
+    "get_connection_status": {
+      "handler": "get_connection_status"
+    },
+    "get_plc_info": {
+      "handler": "get_plc_info"
+    },
+    "get_plc_time": {
+      "handler": "get_plc_time"
+    },
+    "set_plc_time": {
+      "handler": "set_plc_time"
+    }
+  },
+  "legacy": {
+    "read_tag": "read_tags",
+    "read_multiple_tags": "read_tags",
+    "read_tag_by_alias": "read_tags",
+    "write_tag": "write_tags",
+    "write_multiple_tags": "write_tags",
+    "write_tag_by_alias": "write_tags",
+    "read_array": "read_tags",
+    "write_array": "write_tags",
+    "read_string": "read_tags",
+    "write_string": "write_tags",
+    "get_tag_list": "get_tag_list",
+    "list_tags": "list_tags",
+    "ping": "get_plc_info",
+    "get_connection_status": "get_connection_status",
+    "get_plc_info": "get_plc_info",
+    "get_plc_time": "get_plc_time",
+    "set_plc_time": "set_plc_time"
+  },
+  "legacySchemas": {
+    "read_tag": {
+      "properties": {
+        "tag_name": {
+          "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+          "minLength": 1,
+          "title": "Tag Name",
+          "type": "string"
+        },
+        "count": {
+          "anyOf": [
+            {
+              "description": "Number of consecutive array elements, starting at the tag's index.",
+              "minimum": 1,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Count"
+        }
+      },
+      "required": [
+        "tag_name"
+      ],
+      "title": "read_tagArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "write_tag": {
+      "properties": {
+        "tag_name": {
+          "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+          "minLength": 1,
+          "title": "Tag Name",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value"
+        },
+        "data_type": {
+          "anyOf": [
+            {
+              "description": "Expected Logix data type, e.g. REAL, DINT, BOOL, STRING.",
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Data Type"
+        }
+      },
+      "required": [
+        "tag_name",
+        "value"
+      ],
+      "title": "write_tagArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "read_array": {
+      "properties": {
+        "tag_name": {
+          "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+          "minLength": 1,
+          "title": "Tag Name",
+          "type": "string"
+        },
+        "elements": {
+          "description": "Number of consecutive array elements, starting at the tag's index.",
+          "minimum": 1,
+          "title": "Elements",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tag_name",
+        "elements"
+      ],
+      "title": "read_arrayArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "write_array": {
+      "properties": {
+        "tag_name": {
+          "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+          "minLength": 1,
+          "title": "Tag Name",
+          "type": "string"
+        },
+        "values": {
+          "items": {},
+          "minItems": 1,
+          "title": "Values",
+          "type": "array"
+        }
+      },
+      "required": [
+        "tag_name",
+        "values"
+      ],
+      "title": "write_arrayArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "read_string": {
+      "properties": {
+        "tag_name": {
+          "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+          "minLength": 1,
+          "title": "Tag Name",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tag_name"
+      ],
+      "title": "read_stringArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "write_string": {
+      "properties": {
+        "tag_name": {
+          "description": "Controller tag, e.g. 'MotorSpeed' or 'Program:MainProgram.MotorSpeed'. Array elements and members use Logix syntax: 'Tank_Levels[2]', 'Conveyor_Status.Running'.",
+          "minLength": 1,
+          "title": "Tag Name",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value",
+          "type": "string"
+        }
+      },
+      "required": [
+        "tag_name",
+        "value"
+      ],
+      "title": "write_stringArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "get_tag_list": {
+      "properties": {
+        "program": {
+          "anyOf": [
+            {
+              "description": "Omit for controller-scoped tags, '*' for every tag including program tags, or a program name such as 'MainProgram'.",
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Program"
+        }
+      },
+      "title": "get_tag_listArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "read_multiple_tags": {
+      "properties": {
+        "tags": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "minItems": 1,
+          "title": "Tags",
+          "type": "array"
+        }
+      },
+      "required": [
+        "tags"
+      ],
+      "title": "read_multiple_tagsArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "write_multiple_tags": {
+      "properties": {
+        "payloads": {
+          "description": "Entries of the form {'tag_name': ..., 'value': ..., 'data_type': optional}.",
+          "items": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "minItems": 1,
+          "title": "Payloads",
+          "type": "array"
+        }
+      },
+      "required": [
+        "payloads"
+      ],
+      "title": "write_multiple_tagsArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "list_tags": {
+      "properties": {},
+      "title": "list_tagsArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "read_tag_by_alias": {
+      "properties": {
+        "alias": {
+          "description": "Alias defined in the TAG_MAP_FILE tag map.",
+          "minLength": 1,
+          "title": "Alias",
+          "type": "string"
+        }
+      },
+      "required": [
+        "alias"
+      ],
+      "title": "read_tag_by_aliasArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "write_tag_by_alias": {
+      "properties": {
+        "alias": {
+          "description": "Alias defined in the TAG_MAP_FILE tag map.",
+          "minLength": 1,
+          "title": "Alias",
+          "type": "string"
+        },
+        "value": {
+          "title": "Value"
+        }
+      },
+      "required": [
+        "alias",
+        "value"
+      ],
+      "title": "write_tag_by_aliasArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "ping": {
+      "properties": {},
+      "title": "pingArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "get_connection_status": {
+      "properties": {},
+      "title": "get_connection_statusArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "get_plc_info": {
+      "properties": {},
+      "title": "get_plc_infoArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "get_plc_time": {
+      "properties": {},
+      "title": "get_plc_timeArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "set_plc_time": {
+      "properties": {},
+      "title": "set_plc_timeArguments",
+      "type": "object",
+      "additionalProperties": false
+    }
+  },
+  "resultSchema": {
+    "type": "object",
+    "required": [
+      "success",
+      "data",
+      "error",
+      "meta"
+    ],
+    "properties": {
+      "success": {
+        "type": "boolean"
+      },
+      "data": {},
+      "error": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "meta": {
+        "type": "object"
+      }
+    },
+    "additionalProperties": false
+  },
+  "localStatusTools": [
+    "get_connection_status"
+  ]
+}

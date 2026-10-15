@@ -1,3 +1,10 @@
+> **0.3.0 package and tool migration:** Install `industriagents-ethernetip-mcp`
+> from npm (requires uv) or PyPI; the command remains `ethernetip-mcp`.
+> The advertised catalog now contains **8 tools**. Older tool names in
+> the examples below remain compatibility calls. See the
+> [architecture and canonical tool guide](../docs/architecture.md)
+> and [release guide](../docs/release.md).
+
 # ethernetip-python
 
 Python MCP server for Rockwell/Allen-Bradley EtherNet/IP controllers. Built with `pycomm3`, `mcp[cli]` (1.x) and `uv`, it exposes the `ethernetip-mcp` entry point for AI agents and MCP-compatible clients.

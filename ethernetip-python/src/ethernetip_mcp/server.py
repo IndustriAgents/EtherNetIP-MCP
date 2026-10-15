@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 def package_version() -> str:
     try:
-        return version("ethernetip-mcp")
+        return version("industriagents-ethernetip-mcp")
     except PackageNotFoundError:  # pragma: no cover - running from a bare source tree
         return "0.0.0+unknown"
 

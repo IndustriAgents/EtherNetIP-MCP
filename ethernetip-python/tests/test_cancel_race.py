@@ -112,10 +112,8 @@ async def test_cip_cancel_as_the_connect_completes_never_writes() -> None:
 
         client.write_tag = write  # type: ignore[method-assign]
         # In the worker thread, the moment the connection is up: cancel the request.
-        controller.after_open = (
-            lambda _h=holder, _loop=loop: anyio.from_thread.run_sync(cancel_now, _h["responder"], _loop)
-            if "responder" in _h
-            else None
+        controller.after_open = lambda _h=holder, _loop=loop: (
+            anyio.from_thread.run_sync(cancel_now, _h["responder"], _loop) if "responder" in _h else None
         )
         async with create_connected_server_and_client_session(server.mcp) as session:
             await call_expecting_cancel(session, "write_tag", {"tag_name": "Batch_Count", "value": 9})

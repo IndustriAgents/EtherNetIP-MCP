@@ -15,7 +15,7 @@ from dotenv import dotenv_values
 from .eip_client import ConfigError
 from .server import EtherNetIPMCPServer
 
-PROJECT_NAME = "ethernetip-mcp"
+PROJECT_NAME = "industriagents-ethernetip-mcp"
 PACKAGE_DIR = Path(__file__).resolve().parent
 
 # Variables that let the server change the device. Only the process

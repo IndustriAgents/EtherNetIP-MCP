@@ -52,7 +52,7 @@ class WindowsEnviron(MutableMapping[str, str]):
         return isinstance(key, str) and key.upper() in self._data
 
 
-def make_checkout(root: Path, name: str = "ethernetip-mcp") -> Path:
+def make_checkout(root: Path, name: str = "industriagents-ethernetip-mcp") -> Path:
     """A source-checkout layout: <root>/ethernetip-python/src/ethernetip_mcp. Returns the package dir."""
     project = root / "ethernetip-python"
     package = project / "src" / "ethernetip_mcp"

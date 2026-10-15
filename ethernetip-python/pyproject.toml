@@ -1,16 +1,19 @@
 [project]
-name = "ethernetip-mcp"
-version = "0.1.0"
+name = "industriagents-ethernetip-mcp"
+version = "0.3.0"
 description = "MCP server for Allen-Bradley EtherNet/IP controllers with tag tooling."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "IndustriAgents" }]
 dependencies = [
+    "jsonschema>=4.23,<5",
     "anyio>=4.5.0",
     # mcp 2.x renamed FastMCP and moved its modules; this server targets 1.x.
+    # Contract wire errors require CallToolResult passthrough (tested on 1.22+).
     "mcp[cli]>=1.22.0,<2",
-    "pydantic>=2.11.0",
+    # The supported MCP 1.x floor uses typing helpers removed in Pydantic 2.13.
+    "pydantic>=2.11.0,<2.13",
     # eip_client.py sets pycomm3's _cfg["socket_timeout"]; re-check on upgrades.
     "pycomm3>=1.2.14,<1.3",
     "python-dotenv>=1.1.0",
@@ -47,3 +50,6 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: starts the mock PLC and drives the MCP server over stdio",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ethernetip_mcp"]
