@@ -33,8 +33,8 @@ Rebuilding can change archive hashes; these identify the verified files.
 
 | Artifact | SHA-256 |
 |---|---|
-| `industriagents_ethernetip_mcp-0.3.0-py3-none-any.whl` | `d4485ddd106908fe7e445e2b46f0801677f798487b91d4ca3ec7f6f426acd912` |
-| `industriagents_ethernetip_mcp-0.3.0.tar.gz` | `779f94e8856d94a63fc3d8302480779a1ab9189e2f531cb716d8f956a00c6407` |
-| `industriagents-ethernetip-mcp-0.3.0.tgz` | `04e33d75d5bb4d1a4f5bd06f232c163b8eaf73ef730936ae6d6f397c7954a5e6` |
+| `industriagents_ethernetip_mcp-0.3.0-py3-none-any.whl` | `f677507432cf21ef7ce0ee0e21fc5526b63afc11ef4774d12b359ef0b96191ed` |
+| `industriagents_ethernetip_mcp-0.3.0.tar.gz` | `2aa7012b6899cb05c9ddfbda7d97d87bd19b4cf123c76732f5efba9c997597d3` |
+| `industriagents-ethernetip-mcp-0.3.0.tgz` | `28c5ff5e0b4fb4c02dff1d9fb790c50f386c670ce8e2bc1de631f5a2ffdd8adb` |
 
 See [release instructions](release.md) for independent registry publication.

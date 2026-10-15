@@ -50,8 +50,13 @@ ethernetip-python/
 │   ├── __init__.py
 │   ├── cli.py          # entry point: load .env, build the server, run stdio
 │   ├── server.py       # FastMCP wiring, argument errors as envelopes
-│   ├── tools.py        # the 17 tools, write gates, tag map
-│   └── eip_client.py   # configuration, pycomm3 (CIP) and JSON-bridge backends
+│   ├── tools.py        # compatibility exports
+│   ├── protocol/       # 8 advertised tools and legacy dispatch
+│   ├── application/    # protocol operations
+│   ├── domain/         # ports, errors and policy
+│   ├── infrastructure/ # tag maps and audit
+│   ├── adapters/       # native CIP and JSON-bridge implementations
+│   └── eip_client.py   # compatibility import for the native adapter
 └── tests
     ├── fake_pycomm3.py         # LogixDriver stand-in that enforces pycomm3's real signatures
     ├── blackhole_server.py     # the CLI against a fake controller the tests can black-hole
