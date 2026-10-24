@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from fake_pycomm3 import FakeController
+from fake_pycomm3 import FakeController, FakeLogixDriver
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 
@@ -434,9 +434,9 @@ async def test_internal_error_after_a_write_reports_unknown(monkeypatch: pytest.
     async with create_connected_server_and_client_session(server.mcp) as s:
         envelope = await call(s, "write_tag", {"tag_name": "Batch_Count", "value": 9})
         read = await call(s, "read_tag", {"tag_name": "MotorSpeed"})
-    assert envelope["success"] is False and "Internal error in write_tag" in envelope["error"]
-    assert "may have been applied" in envelope["error"]
-    assert envelope["meta"]["outcome"] == "unknown" and envelope["meta"]["request_sent"] is True
+    assert envelope["success"] is False
+    assert envelope["error"] == "Unexpected error while executing tool"
+    assert envelope["meta"]["outcome"] == "unknown" and envelope["meta"]["request_sent"] is None
     assert controller.tags["Batch_Count"] == (9, "DINT")
     assert read["success"] is True
 
@@ -494,3 +494,38 @@ async def test_tool_annotations_never_invite_retries() -> None:
             assert hints.idempotentHint is not False or hints.readOnlyHint, name
     assert tools["list_tags"].annotations.openWorldHint is False
     assert tools["read_tags"].annotations.openWorldHint is True
+
+
+@pytest.mark.parametrize("response_count", [0, 1, 3])
+async def test_malformed_native_batch_reply_never_reports_not_sent(monkeypatch, response_count):
+    native_write = FakeLogixDriver.write
+
+    def malformed(self, *args, **kwargs):
+        results = native_write(self, *args, **kwargs)
+        return (results + [results[-1]])[:response_count]
+
+    monkeypatch.setattr(FakeLogixDriver, "write", malformed)
+    controller = FakeController()
+    async with session(controller, writes=True) as s:
+        result = await call(
+            s,
+            "write_multiple_tags",
+            {
+                "payloads": [
+                    {"tag_name": "MotorSpeed", "value": 1.0},
+                    {"tag_name": "Nope", "value": 1},
+                    {"tag_name": "Batch_Count", "value": 2},
+                ]
+            },
+        )
+    assert controller.tags["MotorSpeed"][0] == 1.0
+    assert controller.tags["Batch_Count"][0] == 2
+    assert len(controller.all_calls("write")) == 1
+    assert result["success"] is False
+    assert result["meta"]["outcome"] == "unknown"
+    assert result["meta"]["request_sent"] is True
+    assert [entry["outcome"] for entry in result["data"]["results"]] == [
+        "unknown",
+        "not_sent",
+        "unknown",
+    ]

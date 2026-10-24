@@ -82,6 +82,31 @@ adapter. A timeout/cancellation after possible dispatch is uncertain, never
 converted to not_sent. There is no new generic retry loop. In particular,
 retrying an unknown control outcome can apply a physical action twice.
 
+## Bounded requests and failure classification
+
+Every request is checked before route selection, argument forwarding, schema
+validation or admission. The contract declares `maxNestingDepth: 32`,
+`maxContainerItems: 10000` and `maxTotalValues: 50000`. The configured
+`max_request_bytes` limit also applies to the exact JSON encoding. An iterative
+walk rejects deep or cyclic objects, oversized containers, non-finite numbers,
+non-string object keys and invalid Unicode without recursive traversal. The
+MCP SDK has already decoded its frame; these bounds limit subsequent application
+work rather than the transport decoder's initial allocation.
+
+Consolidated selector modes validate against their complete JSON schema.
+Existing direct tool signatures and legacy address forms retain their native
+validation and coercion for compatibility. Unknown top-level arguments are
+rejected for every route before an SDK model can discard a misspelled option.
+
+Only explicit argument validation before invocation can establish `not_sent`.
+An unexpected exception from a running handler, including a Pydantic validation
+failure while processing a device reply, returns `meta.outcome: "unknown"` and
+`meta.request_sent: null` for a control operation. Its exception payload stays
+out of the MCP error response. Native adapters retain their more precise send
+tracking for anticipated failures. No generic failure path resends a command.
+Audit-result failures preserve the observed outcome, and JSON text and
+structured content are regenerated together after any `meta.audit_error` flag.
+
 ## Deployment policy and audit
 
 Set `ETHERNETIP_POLICY_FILE` to an explicit JSON policy file. Unknown fields
@@ -123,9 +148,20 @@ unknown, not success. Failure to persist a result is logged and marked
 Audit records omit payloads and credentials. Manage file retention externally;
 this append-only log is not a tamper-proof external audit service.
 
+Policy documents are read only from regular files, with a 64 KiB read bound and
+at most 16 JSON nesting levels. Duplicate fields are rejected. The size bound
+still applies if a file grows during the read. Audit destinations must also be
+regular files; devices and pipes are refused before any audit record is written.
+A FIFO cannot block policy loading or audit admission while waiting for a peer.
+
 ## Protocol capability limits
 
 Live EtherNet/IP uses pycomm3 for supported Logix operations. The JSON mock tests application behavior and failures, not CIP wire interoperability. Batch writes can partially apply and are never presented as atomic.
+
+Batch writes require a native result for every submitted entry. A malformed
+result count after native invocation marks every attempted entry as `unknown`,
+while locally refused entries remain `not_sent`. It never raises an input-error
+classification for an operation that already ran and never resends the batch.
 
 ## Packages
 

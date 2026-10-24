@@ -11,7 +11,6 @@ from typing import Any
 
 import anyio
 from mcp.server.fastmcp import FastMCP
-from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
 from pydantic import ValidationError
 
@@ -122,18 +121,9 @@ class EnvelopeFastMCP(FastMCP):
             message = f"Invalid arguments for {name}: {_describe_validation_error(exc)}"
             meta = {"tool": name, **(NOT_SENT if name in WRITE_TOOLS else {})}
             return metadata.convert_result(fail(message, meta))
-        try:
-            return await super().call_tool(name, arguments)
-        except ToolError as exc:
-            logger.exception("Tool %s raised an unexpected error", name)
-            cause = exc.__cause__ or exc
-            message = f"Internal error in {name}: {type(cause).__name__}: {cause}"
-            meta: dict[str, Any] = {"tool": name}
-            if name in WRITE_TOOLS:
-                # The failure may have come after the request went out.
-                message += ". The write may have been applied; read the value back before trying again."
-                meta.update({"outcome": "unknown", "request_sent": True})
-            return metadata.convert_result(fail(message, meta))
+        # Only the pre-dispatch signature check above proves not_sent. Let the
+        # contract boundary normalize unexpected handler failures conservatively.
+        return await super().call_tool(name, arguments)
 
 
 @dataclass(slots=True)

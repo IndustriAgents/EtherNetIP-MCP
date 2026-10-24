@@ -925,6 +925,20 @@ class EIPClient:
                     error = str(exc) if outcome == failed else "not sent: the batch request failed first"
                     results.append(_entry(base, value, None, error, outcome))
             return (results, exc.meta)
+        if len(tag_results) != len(sent):
+            # The native call already ran. A malformed result count cannot be
+            # treated as input validation (ValueError) or correlated by position.
+            error = (
+                f"Native batch write returned {len(tag_results)} results for {len(sent)} requests; "
+                "the writes may have been applied. They were not resent."
+            )
+            results = [
+                _entry(base, value, None, refused[index], "not_sent")
+                if index in refused
+                else _entry(base, value, None, error, "unknown")
+                for index, (base, _, value, _) in enumerate(prepared)
+            ]
+            return results, with_outcome(meta, "unknown")
         by_index = dict(zip(sent, tag_results, strict=True))
         results = []
         for index, (base, _, value, data_type) in enumerate(prepared):
