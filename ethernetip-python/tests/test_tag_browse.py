@@ -34,6 +34,8 @@ async def test_pages_use_one_snapshot_and_require_matching_scope():
 
 
 def test_byte_budget_and_snapshot_expiration(monkeypatch):
+    # This clock value makes (created + 60) - created round below 60.
+    monkeypatch.setattr(tag_browse.time, "monotonic", lambda: 32756.445238821198)
     tags = [{"tag": f"T{i}", "description": "x" * 40} for i in range(5)]
     snapshot = TagSnapshot.capture(tags, None, "")
     monkeypatch.setattr(tag_browse, "MAX_PAGE_BYTES", snapshot.sizes[0] + 1)

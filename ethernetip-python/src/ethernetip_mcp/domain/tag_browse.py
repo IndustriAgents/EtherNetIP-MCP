@@ -51,8 +51,9 @@ class TagSnapshot:
     def page(self, program: str | None, prefix: str, limit: int, cursor: str | None) -> tuple[dict, dict]:
         if type(limit) is not int or not 1 <= limit <= MAX_PAGE_TAGS:
             raise ValueError("limit must be an integer in 1..500")
-        age = time.monotonic() - self.created
-        if age >= SNAPSHOT_TTL:
+        now = time.monotonic()
+        age = now - self.created
+        if now >= self.created + SNAPSHOT_TTL:
             raise ValueError("Tag cursor expired; start a new browse without cursor")
         if (program, prefix) != (self.program, self.prefix):
             raise ValueError("Tag cursor belongs to another program or prefix")
