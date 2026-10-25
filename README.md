@@ -222,3 +222,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). To report a vulnerability, follow [SECUR
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Inspect `get_connection_status` before device work: its `capabilities` describe backend support and native configuration gates, not device permissions or reachability. See the [protocol assessment](docs/protocol-assessment.md) for supported workflows and verification boundaries.

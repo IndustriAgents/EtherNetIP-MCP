@@ -529,3 +529,14 @@ async def test_malformed_native_batch_reply_never_reports_not_sent(monkeypatch, 
         "not_sent",
         "unknown",
     ]
+
+
+async def test_canonical_lint_read_preserves_exact_value_for_javascript_clients():
+    controller = FakeController()
+    controller.tags["LargeCounter"] = (2**63 - 1, "LINT")
+    async with session(controller) as s:
+        result = await call(s, "read_tags", {"target": "tag", "tag_name": "LargeCounter"})
+    assert result["success"] is True
+    assert result["data"]["value"] == "9223372036854775807"
+    assert result["data"]["data_type"] == "LINT"
+    assert result["meta"]["value_encoding"] == "decimal_string"

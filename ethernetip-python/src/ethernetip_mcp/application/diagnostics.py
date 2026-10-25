@@ -4,6 +4,7 @@ from typing import Annotated, Any
 
 from pydantic import Field
 
+from ethernetip_mcp.domain.capabilities import capability_report
 from ethernetip_mcp.domain.errors import EIPClientError
 from ethernetip_mcp.domain.model import _error_meta, fail, ok
 
@@ -59,6 +60,11 @@ class DiagnosticsOperations:
                 "system_cmds_enabled": self.config.system_cmds_enabled,
                 "tag_aliases": self.tag_map.count(),
                 "tag_map_error": self.tag_map.error,
+                "capabilities": capability_report(
+                    writes_enabled=self.config.writes_enabled,
+                    system_commands_enabled=self.config.system_cmds_enabled,
+                    json_bridge=self.client.config.json_bridge,
+                ),
             }
         )
 

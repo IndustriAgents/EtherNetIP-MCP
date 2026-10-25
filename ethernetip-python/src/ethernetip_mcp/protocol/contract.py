@@ -12,6 +12,7 @@ from mcp.types import CallToolResult, TextContent, Tool
 
 from ..application.execution import Execution
 from .request_limits import RequestError, validate_request
+from .value_encoding import encode_integers
 
 log = logging.getLogger(__name__)
 
@@ -162,6 +163,7 @@ class ContractBoundary:
         value = envelope_of(result)
         if value is None:
             return result
+        value = encode_integers(value)
         return CallToolResult(
             content=[TextContent(type="text", text=json.dumps(value))],
             structuredContent=value,
