@@ -9,6 +9,8 @@ from ethernetip_mcp.infrastructure.maps import TagMap
 
 class CommonOperations:
     def __init__(self, resources, cancel_scope):
+        self.tag_snapshot = None
+        self.tag_snapshot_expiry = None
         self.resources = resources
         self.cancel_scope = cancel_scope
         self.client = self.resources.client

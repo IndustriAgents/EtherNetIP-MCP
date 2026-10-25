@@ -224,3 +224,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). To report a vulnerability, follow [SECUR
 MIT. See [LICENSE](LICENSE).
 
 Inspect `get_connection_status` before device work: its `capabilities` describe backend support and native configuration gates, not device permissions or reachability. See the [protocol assessment](docs/protocol-assessment.md) for supported workflows and verification boundaries.
+
+## Additional protocol workflows
+
+Controller tag browsing supports bounded pages with `limit`, `prefix` and `cursor`. Follow `meta.next_cursor` with the same scope; pages use a retained metadata snapshot, expire after 60 seconds and do not bound pycomm3 upload allocation.
+
+See [the protocol assessment and prioritized roadmap](docs/protocol-assessment.md) for limits, evidence and remaining work.

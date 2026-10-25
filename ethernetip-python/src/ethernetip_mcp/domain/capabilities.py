@@ -26,6 +26,14 @@ def capability_report(
         "scope": "backend_support",
         "device_verified": False,
         "operations": operations,
+        "metadata_browse": {
+            "max_page_tags": 500,
+            "max_page_bytes": 131072,
+            "max_snapshot_tags": 20000,
+            "max_snapshot_bytes": 4194304,
+            "snapshot_ttl_seconds": 60,
+            "native_upload_bounded": False,
+        },
         "prerequisites": [
             "A configured Logix-compatible controller and valid CIP routing path are required for live operations.",
             "Tag metadata and device access permissions determine which addresses and services are available.",

@@ -825,11 +825,13 @@ class EIPClient:
                 payload["program"] = program
             response, meta = await self._json_exchange(label, payload)
             data = self._json_data(response, label, meta, expect=list)
-            tags = [
-                _jsonable({key: item.get(key) for key in TAG_LIST_KEYS}) for item in data if isinstance(item, Mapping)
-            ]
+            if any(not isinstance(item, Mapping) for item in data):
+                raise EIPClientError("get_tag_list returned malformed metadata entries", meta)
+            tags = [_jsonable({key: item.get(key) for key in TAG_LIST_KEYS}) for item in data]
         else:
             raw, meta = await self._run_cip(label, lambda driver: driver.get_tag_list(program=program, cache=False))
+            if not isinstance(raw, list) or any(not isinstance(item, Mapping) for item in raw):
+                raise EIPClientError("get_tag_list returned malformed metadata entries", meta)
             tags = [_tag_definition(item) for item in raw]
         return (tags, {**meta, "count": len(tags)})
 

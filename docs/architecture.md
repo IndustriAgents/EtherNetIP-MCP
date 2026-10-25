@@ -203,3 +203,5 @@ later caller's connection. Array lengths and batch result counts are verified
 before reporting successful reads.
 
 Edit named `resultShapes` in `contract/tools.json`, run `python3 scripts/sync_contract.py` to regenerate advertised data schemas and the packaged resource, then run `python3 scripts/verify_contract.py` to check drift.
+
+Metadata pagination lives in `domain/tag_browse.py`; application diagnostics own one immutable snapshot and its expiry timer. Continuation requests use the retained snapshot without native I/O, while new uploads still use the serialized native client. Replacement/expiry is fenced by snapshot identity. Page and retention limits apply after the native upload; see the protocol assessment for the exact byte accounting.
