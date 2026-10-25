@@ -50,7 +50,13 @@ cmd = (
     if mode == "python"
     else ["node", "--", str(launcher)]
 )
-env = dict(os.environ)
+# Never inherit a configured industrial target or an explicit environment/map file.
+protocol_prefixes = (
+    "BACNET_", "DNP3_", "ETHERCAT_", "ENIP_", "ETHERNETIP_", "MODBUS_",
+    "MQTT_", "SPARKPLUG_", "PROFIBUS_", "PROFINET_", "S7_", "S7COMM_",
+    "REGISTER_MAP_FILE",
+)
+env = {key: value for key, value in os.environ.items() if not key.startswith(protocol_prefixes)}
 env.update(
     {
         "ETHERCAT_BACKEND": "mock",
@@ -140,7 +146,8 @@ try:
     contract = json.loads((repo / "contract/tools.json").read_text())
     assert [t["name"] for t in tools] == [t["name"] for t in contract["tools"]]
     for actual, expected in zip(tools, contract["tools"]):
-        assert actual["inputSchema"] == expected["inputSchema"]
+        for key in ("name", "description", "inputSchema", "outputSchema", "annotations"):
+            assert actual.get(key) == expected.get(key), (key, actual, expected)
     route = next((name, r) for name, r in contract["routes"].items() if "selector" in r)
     send(
         {
@@ -155,7 +162,21 @@ try:
     )
     result = response(3)["result"]
     assert result["isError"] is True and result["structuredContent"]["success"] is False
-    print(repo.name, mode, "OK", len(tools), "tools", flush=True)
+    assert result["structuredContent"] == json.loads(result["content"][0]["text"])
+    send({
+        "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+        "params": {"name": "get_connection_status", "arguments": {}},
+    })
+    status = response(4)["result"]
+    envelope = status["structuredContent"]
+    assert envelope == json.loads(status["content"][0]["text"])
+    assert envelope["success"] is True and not status.get("isError", False)
+    capabilities = envelope["data"]["capabilities"]
+    assert capabilities["scope"] == "backend_support"
+    assert capabilities["device_verified"] is False
+    assert set(capabilities["operations"]) == {tool["name"] for tool in tools}
+    assert any(not op["enabled"] for op in capabilities["operations"].values())
+    print(repo.name, mode, "OK", len(tools), "tools and offline capabilities", flush=True)
 finally:
     proc.stdin.close()
     try:

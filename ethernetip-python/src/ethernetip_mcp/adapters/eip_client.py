@@ -147,6 +147,12 @@ class _CallState:
             self.cancelled = True
             return (self.phase, self.holding_session)
 
+    def interrupt_if_owned(self, interrupt: Callable[[], None]) -> None:
+        """Fence interruption against releasing the session to a later call."""
+        with self._guard:
+            if self.holding_session:
+                interrupt()
+
 
 def with_outcome(meta: OperationMeta, outcome: str) -> OperationMeta:
     """Add the write outcome and whether the request may have reached the device."""
@@ -690,12 +696,12 @@ class EIPClient:
             except TimeoutError:
                 _, holding = state.cancel()
                 if holding:
-                    self._abort_active_socket()
+                    state.interrupt_if_owned(self._abort_active_socket)
                 raise EIPClientError(f"no complete answer within the {deadline:g} s deadline (ENIP_DEADLINE)") from None
             except BaseException:
                 _, holding = state.cancel()
                 if holding:
-                    self._abort_active_socket()
+                    state.interrupt_if_owned(self._abort_active_socket)
                 raise
         except Exception as exc:
             message = _describe(exc)
@@ -729,6 +735,11 @@ class EIPClient:
         if count is not None:
             if not isinstance(result["value"], list):
                 result["value"] = [result["value"]]
+            if len(result["value"]) != count:
+                raise EIPClientError(
+                    f"{label} returned {len(result['value'])} elements, expected {count}",
+                    {**meta, "complete": False},
+                )
             result["elements"] = count
         return (result, meta)
 
@@ -762,6 +773,17 @@ class EIPClient:
                 attempts += meta.get("attempts", 1)
                 if response.get("success"):
                     data = response.get("data") or {}
+                    actual_count = len(data.get("value")) if isinstance(data.get("value"), list) else 1
+                    if count is not None and actual_count != count:
+                        results.append(
+                            {
+                                "tag": base,
+                                "value": None,
+                                "data_type": None,
+                                "error": f"Array read returned {actual_count} elements, expected {count}",
+                            }
+                        )
+                        continue
                     results.append(
                         {"tag": base, "value": data.get("value"), "data_type": data.get("data_type"), "error": None}
                     )
@@ -771,9 +793,20 @@ class EIPClient:
             return (results, {"backend": self.backend, "attempts": attempts})
         requests = [base if count is None else f"{base}{{{count}}}" for base, count in parsed]
         raw, meta = await self._run_cip("read_multiple_tags", lambda driver: driver.read(*requests))
+        native_results = _as_tag_list(raw)
+        if len(native_results) != len(parsed):
+            error = f"Native batch read returned {len(native_results)} results for {len(parsed)} requests"
+            return (
+                [{"tag": base, "value": None, "data_type": None, "error": error} for base, _ in parsed],
+                {**meta, "complete": False},
+            )
         results = []
-        for (base, _), tag_result in zip(parsed, _as_tag_list(raw), strict=True):
+        for (base, count), tag_result in zip(parsed, native_results, strict=True):
             error = _tag_error(tag_result)
+            if not error and count is not None:
+                actual_count = len(tag_result.value) if isinstance(tag_result.value, list) else 1
+                if actual_count != count:
+                    error = f"Native array read returned {actual_count} elements, expected {count}"
             results.append(
                 {
                     "tag": base,
@@ -1202,16 +1235,28 @@ class EIPClient:
             try:
                 state.check()
                 with self._session(state):
-                    state.check()
-                    driver = self._open_locked()
-                    if not repeatable:
-                        driver = self._ensure_live_locked(driver)
-                    state.enter_operation()
-                    phase = "operation"
-                    result = operation(driver)
-                    self._last_contact = time.time()
-                    self._last_io = time.monotonic()
-                    self._last_error = None
+                    try:
+                        state.check()
+                        driver = self._open_locked()
+                        if not repeatable:
+                            driver = self._ensure_live_locked(driver)
+                        state.enter_operation()
+                        phase = "operation"
+                        result = operation(driver)
+                        if not state.cancelled:
+                            self._last_contact = time.time()
+                            self._last_io = time.monotonic()
+                            self._last_error = None
+                    except (_CallStopped, _NotSentError):
+                        raise
+                    except Exception as exc:
+                        # Recovery belongs to this attempt, while it still owns
+                        # the session. A late failure must not drop a new caller's
+                        # connection after handing the lock over.
+                        self._last_error = f"{label}: {_describe(exc)}"
+                        if _is_transient(exc):
+                            self._drop_driver_locked()
+                        raise
             except _CallStopped:
                 raise
             except _NotSentError as exc:
@@ -1224,10 +1269,6 @@ class EIPClient:
             except Exception as exc:
                 transient = _is_transient(exc)
                 message = _describe(exc)
-                with self._session():
-                    self._last_error = f"{label}: {message}"
-                    if transient:
-                        self._drop_driver_locked()
                 meta: OperationMeta = {
                     "backend": "cip",
                     "attempts": attempts,
@@ -1294,7 +1335,7 @@ class EIPClient:
         except TimeoutError as exc:
             phase, holding = state.cancel()
             if holding:
-                self._abort_active_socket()
+                state.interrupt_if_owned(self._abort_active_socket)
             detail = f"no complete answer within the {deadline:g} s deadline (ENIP_DEADLINE)"
             self._last_error = f"{label}: {detail}"
             meta = {
@@ -1310,7 +1351,7 @@ class EIPClient:
         except BaseException:
             phase, holding = state.cancel()
             if holding and phase == "open":
-                self._abort_active_socket()
+                state.interrupt_if_owned(self._abort_active_socket)
             raise
 
     async def _json_request(

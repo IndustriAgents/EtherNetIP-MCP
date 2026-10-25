@@ -336,13 +336,29 @@ async def test_queued_call_hitting_its_deadline_leaves_the_running_call_alone() 
         tg.start_soon(read)
         await anyio.sleep(0.2)
         client.config.deadline = 0.3  # the queued write gets a short deadline
-        with pytest.raises(EIPClientError, match="nothing was sent") as info:
+        # Either the worker's lock timeout or the async deadline can win.
+        # Both must report the same safe outcome, regardless of error prose.
+        with pytest.raises(EIPClientError) as info:
             await client.write_tag("Batch_Count", 5)
         assert info.value.meta["outcome"] == "not_sent"
+        assert info.value.meta["request_sent"] is False
         await anyio.sleep(0.1)
         gate.set()
     assert results["read"][0]["value"] == 1450.0  # its session was not closed under it
     assert controller.all_calls("write") == []
+
+
+def test_worker_lock_timeout_reports_not_sent_without_touching_session() -> None:
+    controller = FakeController()
+    client = make_client(controller, deadline=0.01)
+    sent: list[Any] = []
+    with client._lock:
+        with pytest.raises(EIPClientError) as info:
+            client._execute_sync("queued write", sent.append, repeatable=False)
+    assert info.value.meta["outcome"] == "not_sent"
+    assert info.value.meta["request_sent"] is False
+    assert sent == []
+    assert controller.drivers == []
 
 
 async def test_shutdown_stops_a_write_that_is_still_connecting() -> None:
