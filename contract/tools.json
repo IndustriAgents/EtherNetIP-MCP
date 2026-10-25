@@ -760,7 +760,7 @@
     },
     {
       "name": "get_tag_list",
-      "description": "List tag definitions (name and data type) uploaded from the controller.\n\n        Scope follows pycomm3: no `program` lists controller-scoped tags, '*'\n        lists all tags, and a program name lists that program's tags (named\n        'Program:<name>.<tag>').\n        ",
+      "description": "List tag definitions (name and data type) uploaded from the controller.\n\n        Scope follows pycomm3: no `program` lists controller-scoped tags, '*'\n        lists all tags, and a program name lists that program's tags (named\n        'Program:<name>.<tag>').\n        \n\nReturns a bounded metadata page (default 100, at most 500 tags and 128 KiB of tag JSON). Follow meta.next_cursor with the same program/prefix; meta.complete means the filtered snapshot is exhausted. A new call without cursor uploads definitions and replaces the single retained snapshot (20,000 tags / 4 MiB, expires 60s after upload). Cursors expire on replacement or restart. Prefix filtering occurs after pycomm3 uploads metadata; these limits do not bound native upload allocation or represent atomic/live tag values.",
       "inputSchema": {
         "properties": {
           "program": {
@@ -777,6 +777,33 @@
             "default": null,
             "title": "Program",
             "description": "Omit for controller-scoped tags, '*' for every tag including program tags, or a program name such as 'MainProgram'."
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 500,
+            "default": 100,
+            "description": "Maximum tags per page (1..500); the encoded page byte budget can return fewer."
+          },
+          "prefix": {
+            "type": "string",
+            "maxLength": 256,
+            "default": "",
+            "description": "Case-sensitive literal tag-name prefix; keep identical with cursor."
+          },
+          "cursor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Opaque next_cursor from the previous page; keep the same program and prefix."
           }
         },
         "title": "get_tag_listArguments",
@@ -933,6 +960,45 @@
                   "type": "string"
                 },
                 "description": "JSON pointers to exact decimal strings for integers outside the interoperable JSON safe range."
+              },
+              "total_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "uploaded_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "offset": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "page_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Encoded tag-list content budget; excludes surrounding MCP envelope/metadata and native upload allocations."
+              },
+              "next_cursor": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": "string"
+              },
+              "snapshot_age_ms": {
+                "type": "number",
+                "minimum": 0
+              },
+              "snapshot_ttl_seconds": {
+                "type": "number"
+              },
+              "source": {
+                "const": "metadata_snapshot"
+              },
+              "prefix": {
+                "type": "string"
               }
             },
             "additionalProperties": true,
@@ -1187,6 +1253,35 @@
                       },
                       "transport": {
                         "type": "string"
+                      },
+                      "metadata_browse": {
+                        "type": "object",
+                        "properties": {
+                          "max_page_tags": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "max_page_bytes": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "max_snapshot_tags": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "max_snapshot_bytes": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "snapshot_ttl_seconds": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "native_upload_bounded": {
+                            "const": false
+                          }
+                        },
+                        "description": "Bounds on retained metadata and encoded tag-list page content; excludes MCP envelope and native upload allocations."
                       }
                     }
                   }
@@ -1925,7 +2020,35 @@
             }
           ],
           "default": null,
-          "title": "Program"
+          "title": "Program",
+          "description": "Omit for controller-scoped tags, '*' for every tag including program tags, or a program name such as 'MainProgram'."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 100,
+          "description": "Maximum tags per page (1..500); the encoded page byte budget can return fewer."
+        },
+        "prefix": {
+          "type": "string",
+          "maxLength": 256,
+          "default": "",
+          "description": "Case-sensitive literal tag-name prefix; keep identical with cursor."
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Opaque next_cursor from the previous page; keep the same program and prefix."
         }
       },
       "title": "get_tag_listArguments",
@@ -2672,6 +2795,35 @@
             },
             "transport": {
               "type": "string"
+            },
+            "metadata_browse": {
+              "type": "object",
+              "properties": {
+                "max_page_tags": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "max_page_bytes": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "max_snapshot_tags": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "max_snapshot_bytes": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "snapshot_ttl_seconds": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "native_upload_bounded": {
+                  "const": false
+                }
+              },
+              "description": "Bounds on retained metadata and encoded tag-list page content; excludes MCP envelope and native upload allocations."
             }
           }
         }

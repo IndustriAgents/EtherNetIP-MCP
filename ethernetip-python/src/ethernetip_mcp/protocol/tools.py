@@ -84,6 +84,9 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
             ),
         ]
         | None = None,
+        limit: Annotated[int, Field(strict=True, ge=1, le=500)] = 100,
+        prefix: Annotated[str, Field(max_length=256)] = "",
+        cursor: Annotated[str, Field(min_length=1, max_length=64)] | None = None,
     ) -> dict[str, Any]:
         """List tag definitions (name and data type) uploaded from the controller.
 
@@ -91,7 +94,7 @@ def register_tools(server: FastMCP, resources: ToolResources) -> None:
         lists all tags, and a program name lists that program's tags (named
         'Program:<name>.<tag>').
         """
-        return await operations.get_tag_list(program)
+        return await operations.get_tag_list(program, limit, prefix, cursor)
 
     @server.tool(annotations=annotations_for("read_multiple_tags"))
     async def read_multiple_tags(

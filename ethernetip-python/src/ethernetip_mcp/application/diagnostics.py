@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Annotated, Any
 
 from pydantic import Field
@@ -7,9 +8,15 @@ from pydantic import Field
 from ethernetip_mcp.domain.capabilities import capability_report
 from ethernetip_mcp.domain.errors import EIPClientError
 from ethernetip_mcp.domain.model import _error_meta, fail, ok
+from ethernetip_mcp.domain.tag_browse import SNAPSHOT_TTL, TagSnapshot
 
 
 class DiagnosticsOperations:
+    def _expire_tag_snapshot(self, snapshot):
+        if self.tag_snapshot is snapshot:
+            self.tag_snapshot = None
+            self.tag_snapshot_expiry = None
+
     async def get_tag_list(
         self,
         program: Annotated[
@@ -24,13 +31,30 @@ class DiagnosticsOperations:
             ),
         ]
         | None = None,
+        limit: Annotated[int, Field(strict=True, ge=1, le=500)] = 100,
+        prefix: Annotated[str, Field(max_length=256)] = "",
+        cursor: Annotated[str, Field(min_length=1, max_length=64)] | None = None,
     ) -> dict[str, Any]:
         """List tag definitions (name and data type) uploaded from the controller."""
         try:
-            tags, meta = await self.client.get_tag_list(program)
+            meta = {}
+            if cursor is None:
+                tags, meta = await self.client.get_tag_list(program)
+                snapshot = TagSnapshot.capture(tags, program, prefix)
+                self.tag_snapshot = snapshot
+                if self.tag_snapshot_expiry is not None:
+                    self.tag_snapshot_expiry.cancel()
+                self.tag_snapshot_expiry = asyncio.get_running_loop().call_later(
+                    SNAPSHOT_TTL, self._expire_tag_snapshot, snapshot
+                )
+            else:
+                snapshot = self.tag_snapshot
+                if snapshot is None:
+                    raise ValueError("Unknown tag cursor; start a new browse without cursor")
+            data, page_meta = snapshot.page(program, prefix, limit, cursor)
         except (EIPClientError, ValueError) as exc:
             return fail(str(exc), _error_meta(exc, tool="get_tag_list", program=program))
-        return ok({"program": program, "tags": tags}, meta)
+        return ok(data, {**meta, **page_meta})
 
     async def ping(self) -> dict[str, Any]:
         """Check that the controller (or mock) answers, by requesting its identity."""
